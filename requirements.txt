@@ -1,0 +1,6 @@
+# SysPy deliberately depends on nothing outside the standard library.
+# Optional extras, only needed for specific features:
+#
+#   opencv-python-headless   -> webcam capture (agent side)
+#   pynput                   -> keylogger on Linux/macOS (agent side)
+#   pyinstaller              -> build a standalone .exe (build machine only)

