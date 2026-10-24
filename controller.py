@@ -121,7 +121,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.stopall:
         return stop_all_controllers(args.port)
 
-    root = os.path.dirname(os.path.abspath(__file__))
+    if getattr(sys, "frozen", False):
+        root = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        root = os.path.dirname(os.path.abspath(__file__))
 
     missing = check_assets()
     if missing:

