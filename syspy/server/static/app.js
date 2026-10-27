@@ -315,6 +315,7 @@ function renderTree() {
           <input type="checkbox" class="agent-chk" data-id="${a.id}" ${isChecked} style="margin:0;">
           <span class="name" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(a.display)}</span>
           <span class="badge ${a.online === false ? "offline" : "online"}">${a.online === false ? "OFF" : "ON"}</span>
+          <button class="ghost sm rename-btn" data-id="${a.id}" title="Rename">&#9998;</button>
         </div>
         <div class="sub" style="margin-left:22px;font-size:11px;opacity:0.7;">hop=${a.hop || 0} ${escapeHtml((a.info && a.info.system) || "")}</div>
         <div class="bars" style="margin-left:22px;">
@@ -323,10 +324,20 @@ function renderTree() {
         </div>`;
 
       const chk = item.querySelector(".agent-chk");
-      chk.onclick = (e) => {
-        e.stopPropagation();
-        toggleCheck(a.id, chk.checked);
-      };
+      if (chk) {
+        chk.onclick = (e) => {
+          e.stopPropagation();
+          toggleCheck(a.id, chk.checked);
+        };
+      }
+      const renameBtn = item.querySelector(".rename-btn");
+      if (renameBtn) {
+        renameBtn.onclick = (e) => {
+          e.stopPropagation();
+          const nick = prompt("Rename host:", a.display);
+          if (nick !== null) api("/api/nick", { method: "POST", body: JSON.stringify({ agent: a.id, nick: nick.trim() }) });
+        };
+      }
 
       item.onclick = (e) => {
         state.selected = a.id;
@@ -801,6 +812,29 @@ function handleJson(id, payload) {
     renderPropertiesModal(payload);
   } else if (kind === "search_results") {
     renderSearchResults(payload);
+  } else if (kind === "lan_scan") {
+    const reportingAgent = state.agents.get(id);
+    const existingIps = new Set(Array.from(state.agents.values()).map(a => (a.info && a.info.address) || ""));
+    (payload.hosts || []).forEach(h => {
+      const ip = h.ip || h.address;
+      if (ip && !existingIps.has(ip)) {
+        const dummyId = "unmanaged:" + ip;
+        if (!state.agents.has(dummyId)) {
+          state.agents.set(dummyId, {
+            id: dummyId,
+            remote_id: ip,
+            name: (h.hostname || ip) + " [LAN]",
+            display: (h.hostname || ip) + " [LAN]",
+            version: "-",
+            online: false,
+            parent: reportingAgent ? reportingAgent.remote_id : "",
+            info: { system: "Unmanaged LAN Device", address: ip },
+            stats: { cpu: 0, ram: 0 }
+          });
+        }
+      }
+    });
+    renderTree();
   } else if (kind === "fs_op_result") {
     if (payload.success) {
       toast(`Operation ${payload.op || ""} succeeded`);
@@ -2158,14 +2192,37 @@ if (state.token) start(); else $("login").classList.remove("hidden");
     const cmd = prompt("Command to run on selected agents:");
     if (cmd) bulk("run", { cmd });
   };
+  if ($("addpc-btn")) {
+    $("addpc-btn").onclick = async () => {
+      try {
+        const data = await api("/api/install");
+        const line = prompt("Run this on the target PC (PowerShell):", data.line);
+        if (line) navigator.clipboard.writeText(line);
+        toast("Copied. Paste it into PowerShell on the target.");
+      } catch (err) {
+        alert("Failed to get install line: " + err);
+      }
+    };
+  }
+  if ($("sel-rename")) {
+    $("sel-rename").onclick = () => bulk("rename", { pattern: $("sel-pattern").value || "{host}" });
+  }
   if ($("sel-push")) $("sel-push").onclick = () => bulk("push");
   if ($("sel-restart")) $("sel-restart").onclick = () => confirm("Restart selected agents?") && bulk("restart");
   if ($("sel-uninstall")) $("sel-uninstall").onclick = () => confirm("Uninstall selected agents?") && bulk("uninstall");
   if ($("sel-purge")) $("sel-purge").onclick = () => confirm("Purge selected agents? Final.") && bulk("purge");
-  if ($("lan-btn")) $("lan-btn").onclick = () => {
+  if ($("lan-btn")) $("lan-btn").onclick = async () => {
+    const user = prompt("LAN spread - username (blank = current user):", "") ?? "";
+    const password = user ? (prompt("Password:", "") ?? "") : "";
+    const domain = user ? (prompt("Domain (blank for local):", "") ?? "") : "";
     if (state.selected) {
-      sendAgentCommand(state.selected, "lan.scan");
+      const target = prompt("IP to push (blank = sweep):", "");
+      if (target) {
+        sendCommand(`lan.push ${target} ${user} ${password} ${domain}`);
+      } else {
+        sendCommand(user ? `lan.spread ${user} ${password} ${domain}` : "lan.spread");
+      }
     } else {
-      alert("Select an agent first to trigger LAN scan");
+      sendCommand(user ? `lan.spread ${user} ${password} ${domain}` : "lan.spread");
     }
   };

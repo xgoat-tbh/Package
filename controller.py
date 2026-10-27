@@ -130,6 +130,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         root = os.path.dirname(os.path.abspath(__file__))
 
+    os.environ.setdefault("SYSPY_DATA", os.path.join(root, "data"))
+    os.makedirs(os.environ["SYSPY_DATA"], exist_ok=True)
+
     missing = check_assets()
     if missing:
         print(f"  error: missing dashboard files: {', '.join(missing)}")

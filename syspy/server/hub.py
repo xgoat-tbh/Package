@@ -108,6 +108,7 @@ class Hub:
         self._running = True
         self._dirty = False
         self._outbox: list[tuple[str, dict[str, Any]]] = []
+        self._roster_sent: dict[str, float] = {}
 
         self._load_db()
         threading.Thread(target=self._flush_db_loop, name="hub-db-flush", daemon=True).start()
@@ -430,6 +431,15 @@ class Hub:
             threading.Timer(1.5, self._probe, args=(agent_id,)).start()
         else:
             self.publish({"type": "agent", "agent": agent.to_dict()})
+        self._maybe_send_roster(agent.remote_id)
+
+    def _maybe_send_roster(self, agent_id: str) -> None:
+        now = time.time()
+        if now - self._roster_sent.get(agent_id, 0.0) < 60.0:
+            return
+        self._roster_sent[agent_id] = now
+        ids = [a.id.split(":", 1)[-1] for a in self.all()]
+        self.send("agent:" + agent_id, {"t": "roster", "ids": ids})
 
     def _probe(self, agent_id: str) -> None:
         """Ask a fresh agent for its version so we can prove the link works."""

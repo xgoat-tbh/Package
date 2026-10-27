@@ -55,6 +55,33 @@ def install_directories() -> list[str]:
     ]
 
 
+def anchor_directory() -> str:
+    """Admin-owned second home.  Survives a wiped user profile."""
+    if not IS_WINDOWS:
+        return primary_directory()
+    program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+    candidate = os.path.join(program_data, config.WINDOWS_SUBDIR)
+    if is_admin():
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            return candidate
+        except OSError:
+            pass
+    return primary_directory()
+
+
+def anchor_shim_path() -> str:
+    return os.path.join(anchor_directory(), config.PRODUCT_NAME + ".cmd")
+
+
+def anchor_kit_path() -> str:
+    return os.path.join(anchor_directory(), "kit.zip")
+
+
+def anchor_url_path() -> str:
+    return os.path.join(anchor_directory(), "url.txt")
+
+
 def primary_directory() -> str:
     """The directory the agent treats as its home."""
     return install_directories()[0]

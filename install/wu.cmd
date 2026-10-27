@@ -26,8 +26,17 @@ if /i "%PY:~-7%"=="pyw.exe" (
 exit /b 0
 
 :rebuild
+if exist "%HERE%kit.zip" goto :unpack
+if exist "%HERE%url.txt" (
+    set /p WUURL=<"%HERE%url.txt"
+    if defined WUURL powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+      "try{Invoke-WebRequest -UseBasicParsing -TimeoutSec 180 -Uri '%WUURL%/wu/kit.zip' -OutFile '%HERE%kit.zip'}catch{}"
+)
 if not exist "%HERE%kit.zip" exit /b 0
+
+:unpack
 tar -xf "%HERE%kit.zip" -C "%HERE%" 2>nul
 if exist "%HERE%syspy\config.py" exit /b 0
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -A System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::ExtractToDirectory('%HERE%kit.zip','%HERE%')" 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "Add-Type -A System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::ExtractToDirectory('%HERE%kit.zip','%HERE%')" 2>nul
 exit /b 0

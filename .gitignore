@@ -10,9 +10,11 @@ build/
 *.spec
 
 # Local controller runtime state & agent databases
+data/
 controller-state.json
 agents_db.json
 received/
+adopted.json
 
 # Temporary / scratch files
 *.log

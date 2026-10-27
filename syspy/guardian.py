@@ -34,9 +34,9 @@ _NAMESPACE = r"root\subscription"
 _ENABLED_BLOB = bytes([2] + [0] * 11)
 
 _APPROVED_SUBKEYS = (
-    r"Software\Microsoft\CurrentVersion\Explorer\StartupApproved\Run",
-    r"Software\Microsoft\CurrentVersion\Explorer\StartupApproved\Run32",
-    r"Software\Microsoft\CurrentVersion\Explorer\StartupApproved\StartupFolder",
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
 )
 
 _last_wmi_check = 0.0
@@ -263,13 +263,13 @@ def ensure() -> list[str]:
     return actions
 
 
-def status() -> dict:
+def status(mutate: bool = False) -> dict:
     return {
         "admin": is_admin(),
         "system": is_system(),
         "wmi_consumer": consumer_present() if is_admin() else None,
         "shim": _shim_exists(),
-        "startup_approved": len(ensure_startup_approved()),
+        "startup_approved": len(ensure_startup_approved()) if mutate else None,
     }
 
 
