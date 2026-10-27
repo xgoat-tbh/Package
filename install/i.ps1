@@ -80,7 +80,7 @@ function Resolve-ConsolePython {
     return $null
 }
 
-function To-Windowless([string]$exe) {
+function ConvertTo-Windowless([string]$exe) {
     $leaf = Split-Path $exe -Leaf
     if ($leaf -ieq 'python.exe') {
         $w = Join-Path (Split-Path $exe) 'pythonw.exe'
@@ -151,6 +151,6 @@ if (-not $NoStart -and $py) {
     $launchArgs += (Join-Path $target 'agent.py')
     $launchArgs += @('--hidden')
     Say "  starting agent"
-    Start-Process -FilePath (To-Windowless $py.Exe) -ArgumentList $launchArgs -WindowStyle Hidden
+    Start-Process -FilePath (ConvertTo-Windowless $py.Exe) -ArgumentList $launchArgs -WindowStyle Hidden
 }
 'ok'
