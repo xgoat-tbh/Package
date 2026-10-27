@@ -12,7 +12,7 @@ from typing import Iterable
 MANIFEST_NAME = "syspy-manifest.json"
 
 #: Files and folders that make up a deployable agent build.
-BUNDLE_FILES = ("agent.py",)
+BUNDLE_FILES = ("agent.py", "bootstrap.py")
 BUNDLE_DIRS = ("syspy",)
 
 SKIP_DIRS = {"__pycache__", ".git", ".idea", ".vscode", "received", "dist"}

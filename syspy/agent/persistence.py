@@ -123,7 +123,7 @@ def _write_run_keys(launcher: str) -> list[str]:
                 winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, command)
                 written.append(f"{label}\\Run\\{value_name}")
             except OSError:
-                break
+                continue
     return written
 
 

