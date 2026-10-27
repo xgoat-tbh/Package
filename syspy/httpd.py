@@ -257,6 +257,11 @@ class _Handler(BaseHTTPRequestHandler):
         handler = self.server.app._socket_handler  # type: ignore[attr-defined]
         if handler is None:
             return
+        try:
+            import socket as _sock
+            self.connection.setsockopt(_sock.SOL_SOCKET, _sock.SO_KEEPALIVE, 1)
+        except Exception:
+            pass
         socket = ws.WebSocket(self.rfile, self.wfile)
         request = Request("GET", parsed.path, parse_qs(parsed.query), self.headers, b"")
         handler(socket, request)

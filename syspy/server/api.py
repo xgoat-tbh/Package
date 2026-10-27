@@ -383,6 +383,13 @@ class Api:
                     break
                 if opcode == ws.OP_PING:
                     socket.pong(payload)
+                elif opcode == ws.OP_TEXT:
+                    try:
+                        msg = json.loads(payload.decode("utf-8"))
+                        if msg.get("type") == "ping":
+                            socket.send_text(json.dumps({"type": "pong"}))
+                    except Exception:
+                        pass
         finally:
             self.hub.unsubscribe(channel)
 

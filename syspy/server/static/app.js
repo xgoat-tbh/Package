@@ -150,14 +150,33 @@ async function start() {
 }
 
 function connect() {
-  if (state.socket) state.socket.close();
+  if (state.socket) {
+    try { state.socket.close(); } catch(e) {}
+  }
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(
     `${protocol}//${location.host}/ws?token=${encodeURIComponent(state.token)}`);
   state.socket = socket;
 
-  socket.onmessage = (event) => handleEvent(JSON.parse(event.data));
-  socket.onclose = () => { setWsStatus(false); setTimeout(connect, 2000); };
+  // Browser keepalive ping every 5 seconds so Render proxy never drops the WebSocket
+  let pingInterval = setInterval(() => {
+    if (socket.readyState === WebSocket.OPEN) {
+      try { socket.send(JSON.stringify({ type: "ping" })); } catch(e) {}
+    }
+  }, 5000);
+
+  socket.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.type === "pong") return;
+      handleEvent(data);
+    } catch(e) {}
+  };
+  socket.onclose = () => {
+    clearInterval(pingInterval);
+    setWsStatus(false);
+    setTimeout(connect, 1500);
+  };
   socket.onopen = () => { /* wait for snapshot/relay event from server */ };
 }
 
