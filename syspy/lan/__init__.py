@@ -12,7 +12,6 @@ from .discover import (
     local_subnets,
     arp_table,
     sweep,
-    discover,
     classify,
     same_subnet,
     subnet_hosts,
