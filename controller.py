@@ -26,8 +26,12 @@ STATIC_FILES = ("index.html", "app.js", "style.css")
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SysPy controller")
-    parser.add_argument("--host", default=os.environ.get("SYSPY_HOST", config.DASHBOARD_HOST),
-                        help="interface to bind (default: loopback only)")
+    # A container platform must bind 0.0.0.0 or its health check fails and every
+    # one-liner returns 502.  Never rely on the operator remembering the env var.
+    _cloud = bool(os.environ.get("RENDER") or os.environ.get("PORT"))
+    _default_host = os.environ.get("SYSPY_HOST") or ("0.0.0.0" if _cloud else config.DASHBOARD_HOST)
+    parser.add_argument("--host", default=_default_host,
+                        help="interface to bind (0.0.0.0 when hosted, else loopback)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT") or config.DASHBOARD_PORT))
     parser.add_argument("--password", default="", help="dashboard password")
     parser.add_argument("--no-browser", action="store_true")

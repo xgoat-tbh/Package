@@ -216,6 +216,7 @@ class Api:
             script = webinstall.render(
                 base=request.param("base") or _base(request),
                 group=request.param("group"),
+                target=request.param("target"),
                 protect=request.param("protect", "1") != "0",
                 elevate=request.param("elevate", "1") != "0",
             )

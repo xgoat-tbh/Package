@@ -53,7 +53,7 @@ AGENT_TIMEOUT = 45.0
 # Dashboard
 # --------------------------------------------------------------------------
 
-DASHBOARD_HOST = "127.0.0.1"
+DASHBOARD_HOST = os.environ.get("SYSPY_HOST", "127.0.0.1")
 DASHBOARD_PORT = 8787
 
 # --------------------------------------------------------------------------
@@ -153,18 +153,24 @@ def os_kind() -> str:
     return "darwin" if _sys.platform == "darwin" else "linux"
 
 
+def _deploy_path() -> str:
+    return os.environ.get("SYSPY_DEPLOY") or os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "deploy.json"))
+
+
 def _deploy() -> dict:
     if "deploy" not in _host_cache:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "deploy.json")
+        path = _deploy_path()
         try:
-            with open(os.path.abspath(path), "r", encoding="utf-8-sig") as handle:
+            with open(path, "r", encoding="utf-8-sig") as handle:
                 _host_cache["deploy"] = _json.load(handle) or {}
         except Exception:
             _host_cache["deploy"] = {}
         if not _host_cache["deploy"].get("salt"):
             _host_cache["deploy"]["salt"] = secrets.token_hex(4)
             try:
-                with open(os.path.abspath(path), "w", encoding="utf-8") as handle:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as handle:
                     _json.dump(_host_cache["deploy"], handle, indent=1)
             except OSError:
                 pass
@@ -230,3 +236,54 @@ def subnet() -> str:
         except Exception:
             _host_cache["subnet"] = ""
     return _host_cache["subnet"]
+
+
+# ---------------------------------------------------------------------------
+# Deployment-supplied identity.
+#
+# MUST be the last block in this file: _deploy() has to already exist.
+#
+# install/i.ps1, syspy/server/webinstall.py and bootstrap.install() all write
+# "room" and "pass" into deploy.json, but nothing ever read them back, so an
+# operator who set SYSPY_ROOM split the fleet in half.  Precedence is
+# env -> deploy.json -> built-in default.
+#
+# Do not move these above _deploy() and do not turn them into functions; the
+# module-level names are read by topic_up/topic_down and by hub/webinstall.
+# ---------------------------------------------------------------------------
+
+def _setting(key: str, env: str, fallback: str) -> str:
+    value = (os.environ.get(env) or "").strip()
+    if value:
+        return value
+    try:
+        return str(_deploy().get(key) or fallback)
+    except Exception:
+        return fallback
+
+
+ROOM = _setting("room", "SYSPY_ROOM", ROOM)
+PASSPHRASE = _setting("pass", "SYSPY_PASS", PASSPHRASE)
+
+
+def controller_id() -> str:
+    """Stable across restarts and redeploys.  A random id orphans the session."""
+    env = (os.environ.get("SYSPY_CLIENT_ID") or "").strip()
+    if env:
+        return env
+    path = os.path.join(os.environ.get("SYSPY_DATA") or ROOT, "controller-id")
+    try:
+        with open(path, "r", encoding="ascii") as handle:
+            got = handle.read().strip()
+            if got:
+                return got
+    except OSError:
+        pass
+    made = "syspy-c-" + secrets.token_hex(4)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="ascii") as handle:
+            handle.write(made)
+    except OSError:
+        pass
+    return made

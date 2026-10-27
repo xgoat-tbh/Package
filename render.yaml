@@ -3,22 +3,23 @@ services:
     name: syspy-controller
     runtime: python
     plan: free
-    region: oregon
-    buildCommand: "python -m compileall -q syspy || true"
-    startCommand: "python controller.py --host 0.0.0.0 --port $PORT --no-browser"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python controller.py --host 0.0.0.0 --no-browser
     healthCheckPath: /api/health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.12.8
-      - key: SYSPY_PASSWORD
-        generateValue: true
-      - key: SYSPY_ROOM
-        value: syspy-CHANGEME-9f31
-      - key: SYSPY_PASS
-        value: CHANGEME-long-random-passphrase
-      - key: SYSPY_URL
-        sync: false            # set to https://<app>.onrender.com after first deploy
+        value: "3.12.8"
+      - key: SYSPY_HOST                 # PATCH-01: without this the deploy is unhealthy
+        value: 0.0.0.0
+      - key: SYSPY_CLIENT_ID            # PATCH-08: stable MQTT session across deploys
+        value: syspy-controller-1
       - key: SYSPY_DATA
         value: /opt/render/project/src/data
-      - key: SYSPY_PROTECTED
-        value: "1"
+      - key: SYSPY_PASSWORD             # else a new random password every boot
+        sync: false
+      - key: SYSPY_URL                  # https://<app>.onrender.com
+        sync: false
+      - key: SYSPY_ROOM                 # set BEFORE the first victim, never change
+        sync: false
+      - key: SYSPY_PASS                 # same
+        sync: false

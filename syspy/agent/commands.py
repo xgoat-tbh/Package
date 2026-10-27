@@ -752,7 +752,7 @@ def cmd_lan_refresh(agent, argument: str):
 @command("guardian.status")
 def cmd_guardian(agent, argument: str):
     """Reports status of WMI consumer, shim, and startup approval."""
-    return "\n".join(f"{k:16} {v}" for k, v in guardian.status().items())
+    return "\n".join(f"{k:16} {v}" for k, v in guardian.status(mutate=True).items())
 
 
 @command("guardian.install")

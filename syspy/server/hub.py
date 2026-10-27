@@ -473,7 +473,7 @@ class Hub:
         while self._running:
             for host, port, use_tls in config.broker_order():
                 try:
-                    client = MqttClient(config.short_id() + "-c", self._on_message)
+                    client = MqttClient(config.controller_id(), self._on_message)
                     client.connect(
                         host, port, use_tls,
                         clean_session=False,

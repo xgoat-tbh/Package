@@ -69,6 +69,12 @@ async function api(path, options = {}) {
 
 function sendCommand(command) {
   if (!state.selected || !command) return;
+  const target = state.agents.get(state.selected);
+  if (target && target.__ghost) {
+    appendTerminal(state.selected, "$ " + command, "in");
+    appendTerminal(state.selected, "not managed yet - use LAN push, or run the one-liner here", "sys");
+    return;
+  }
   appendTerminal(state.selected, "$ " + command, "in");
   api("/api/cmd", {
     method: "POST",
@@ -289,7 +295,10 @@ function renderTree() {
   const treeEl = $("agent-tree");
   if (!treeEl) return;
   treeEl.innerHTML = "";
-  $("agent-count").textContent = `${state.agents.size} HOST${state.agents.size === 1 ? "" : "S"}`;
+  const realCount = [...state.agents.values()].filter(a => !a.__ghost).length;
+  const ghostCount = state.agents.size - realCount;
+  $("agent-count").textContent =
+    `${realCount} HOST${realCount === 1 ? "" : "S"}` + (ghostCount ? ` +${ghostCount} seen` : "");
 
   const agentsList = Array.from(state.agents.values());
   const byParent = new Map();
@@ -304,12 +313,6 @@ function renderTree() {
     for (const a of children) {
       const item = document.createElement("li");
       item.className = "agent-item" + (a.id === state.selected ? " selected" : "") + (a.online === false ? " offline" : "");
-      item.style.paddingLeft = `${depth * 14 + 6}px`;
-
-      const cpu = Math.round((a.stats && a.stats.cpu) || 0);
-      const ram = Math.round((a.stats && a.stats.ram) || 0);
-      const isChecked = state.checked.has(a.id) ? "checked" : "";
-
       item.innerHTML = `
         <div class="name-row" style="display:flex;align-items:center;gap:6px;">
           <input type="checkbox" class="agent-chk" data-id="${a.id}" ${isChecked} style="margin:0;">
@@ -322,6 +325,13 @@ function renderTree() {
           <div class="bar" title="cpu ${cpu}%"><i style="width:${cpu}%"></i></div>
           <div class="bar" title="ram ${ram}%"><i style="width:${ram}%;background:var(--warn)"></i></div>
         </div>`;
+
+      if (a.__ghost) {
+        item.classList.add("ghost");
+        item.title = "Discovered on the LAN but not managed yet - use LAN push";
+        const box = item.querySelector(".agent-chk");
+        if (box) box.remove();
+      }
 
       const chk = item.querySelector(".agent-chk");
       if (chk) {
@@ -813,26 +823,15 @@ function handleJson(id, payload) {
   } else if (kind === "search_results") {
     renderSearchResults(payload);
   } else if (kind === "lan_scan") {
-    const reportingAgent = state.agents.get(id);
-    const existingIps = new Set(Array.from(state.agents.values()).map(a => (a.info && a.info.address) || ""));
     (payload.hosts || []).forEach(h => {
-      const ip = h.ip || h.address;
-      if (ip && !existingIps.has(ip)) {
-        const dummyId = "unmanaged:" + ip;
-        if (!state.agents.has(dummyId)) {
-          state.agents.set(dummyId, {
-            id: dummyId,
-            remote_id: ip,
-            name: (h.hostname || ip) + " [LAN]",
-            display: (h.hostname || ip) + " [LAN]",
-            version: "-",
-            online: false,
-            parent: reportingAgent ? reportingAgent.remote_id : "",
-            info: { system: "Unmanaged LAN Device", address: ip },
-            stats: { cpu: 0, ram: 0 }
-          });
-        }
-      }
+      if (h.is_self) return;
+      const hostId = "lan:" + h.ip;
+      if ([...state.agents.values()].some(a => a.id === hostId)) return;
+      state.agents.set(hostId, {
+        id: hostId, __ghost: true, parent: id.replace(/^agent:/, ""), name: h.hostname || h.ip,
+        display: h.hostname || h.ip, online: true, hop: 0, version: "?",
+        stats: {}, info: { system: (h.kind || "unknown") + " " + (h.ports || []).join(","), address: h.ip },
+      });
     });
     renderTree();
   } else if (kind === "fs_op_result") {

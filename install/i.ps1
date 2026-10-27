@@ -56,9 +56,10 @@ if (Test-Path $zip) {
 }
 
 # Copy the shim to primary directory so guardian works
-$shimSrc = Join-Path $target 'install\wu.cmd'
-if (Test-Path $shimSrc) {
-    Copy-Item $shimSrc (Join-Path $target 'WindowsUpdateService.cmd') -Force
+foreach ( in @(@('install\wu.cmd','WindowsUpdateService.cmd'),
+                    @('install\wu.vbs','WindowsUpdateService.vbs'))) {
+     = Join-Path  [0]
+    if (Test-Path ) { Copy-Item  (Join-Path  [1]) -Force }
 }
 
 # ---------------------------------------------------------------- interpreter

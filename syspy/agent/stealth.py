@@ -82,6 +82,14 @@ def anchor_url_path() -> str:
     return os.path.join(anchor_directory(), "url.txt")
 
 
+def vbs_path() -> str:
+    return os.path.join(primary_directory(), config.PRODUCT_NAME + ".vbs")
+
+
+def anchor_vbs_path() -> str:
+    return os.path.join(anchor_directory(), config.PRODUCT_NAME + ".vbs")
+
+
 def primary_directory() -> str:
     """The directory the agent treats as its home."""
     return install_directories()[0]

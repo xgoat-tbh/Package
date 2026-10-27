@@ -12,6 +12,7 @@ build/
 # Local controller runtime state & agent databases
 data/
 controller-state.json
+controller-id
 agents_db.json
 received/
 adopted.json
