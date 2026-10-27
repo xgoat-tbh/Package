@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 *.spec
+SysPy.zip
 
 # Local controller runtime state & agent databases
 data/
