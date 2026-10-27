@@ -157,8 +157,8 @@ function connect() {
   state.socket = socket;
 
   socket.onmessage = (event) => handleEvent(JSON.parse(event.data));
-  socket.onclose = () => { setRelay(false); setTimeout(connect, 2500); };
-  socket.onopen = () => setRelay(true);
+  socket.onclose = () => { setWsStatus(false); setTimeout(connect, 2000); };
+  socket.onopen = () => { /* wait for snapshot/relay event from server */ };
 }
 
 /* ------------------------------------------------------------------ */
@@ -313,6 +313,12 @@ function renderTree() {
     for (const a of children) {
       const item = document.createElement("li");
       item.className = "agent-item" + (a.id === state.selected ? " selected" : "") + (a.online === false ? " offline" : "");
+      item.style.paddingLeft = `${depth * 14 + 6}px`;
+
+      const cpu = Math.round((a.stats && a.stats.cpu) || 0);
+      const ram = Math.round((a.stats && a.stats.ram) || 0);
+      const isChecked = state.checked.has(a.id) ? "checked" : "";
+
       item.innerHTML = `
         <div class="name-row" style="display:flex;align-items:center;gap:6px;">
           <input type="checkbox" class="agent-chk" data-id="${a.id}" ${isChecked} style="margin:0;">
@@ -465,6 +471,14 @@ function applyStats(id, stats) {
 function setRelay(up) {
   $("relay-dot").classList.toggle("up", !!up);
   $("relay-label").textContent = up ? "RELAY CONNECTED" : "RELAY DISCONNECTED";
+}
+
+function setWsStatus(connected) {
+  if (!connected) {
+    // If the browser websocket to controller dropped, don't show "RELAY DISCONNECTED", show WS reconnecting
+    $("relay-dot").classList.remove("up");
+    $("relay-label").textContent = "DASHBOARD RECONNECTING...";
+  }
 }
 
 /* ------------------------------------------------------------------ */
