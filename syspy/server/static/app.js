@@ -14,6 +14,8 @@ const state = {
   autoScroll: true,
   splitView: false,
   interactiveMouse: false,
+  checked: new Set(),
+  collapsed: new Set(),
   fe: {
     currentPath: "This PC",
     isThisPc: true,
@@ -241,8 +243,117 @@ function upsertAgent(agent) {
 /* Rendering                                                          */
 /* ------------------------------------------------------------------ */
 
+
+function updateSelBar() {
+  const bar = $("sel-bar");
+  if (!bar) return;
+  const count = state.checked.size;
+  $("sel-count").textContent = `${count} selected`;
+  if (count > 0 || ($("sel-mode") && $("sel-mode").value !== "selected")) {
+    bar.classList.remove("hidden");
+  } else {
+    bar.classList.add("hidden");
+  }
+}
+
+function toggleCheck(id, on) {
+  if (on) state.checked.add(id);
+  else state.checked.delete(id);
+  updateSelBar();
+}
+
+function selectAll(on) {
+  for (const a of state.agents.values()) {
+    if (on) state.checked.add(a.id);
+    else state.checked.delete(a.id);
+  }
+  renderTree();
+  updateSelBar();
+}
+
+async function bulk(verb, extra = {}) {
+  const mode = $("sel-mode") ? $("sel-mode").value : "selected";
+  const targets = mode === "selected" ? Array.from(state.checked) : mode;
+  try {
+    const res = await api("/api/action", {
+      method: "POST",
+      body: JSON.stringify({ verb, targets, ...extra })
+    });
+    console.log("Bulk action result:", res);
+  } catch (err) {
+    alert("Bulk action failed: " + err);
+  }
+}
+
+function renderTree() {
+  const treeEl = $("agent-tree");
+  if (!treeEl) return;
+  treeEl.innerHTML = "";
+  $("agent-count").textContent = `${state.agents.size} HOST${state.agents.size === 1 ? "" : "S"}`;
+
+  const agentsList = Array.from(state.agents.values());
+  const byParent = new Map();
+  for (const a of agentsList) {
+    const k = a.parent ? "agent:" + a.parent : "__root__";
+    if (!byParent.has(k)) byParent.set(k, []);
+    byParent.get(k).push(a);
+  }
+
+  function walk(key, depth) {
+    const children = byParent.get(key) || [];
+    for (const a of children) {
+      const item = document.createElement("li");
+      item.className = "agent-item" + (a.id === state.selected ? " selected" : "") + (a.online === false ? " offline" : "");
+      item.style.paddingLeft = `${depth * 14 + 6}px`;
+
+      const cpu = Math.round((a.stats && a.stats.cpu) || 0);
+      const ram = Math.round((a.stats && a.stats.ram) || 0);
+      const isChecked = state.checked.has(a.id) ? "checked" : "";
+
+      item.innerHTML = `
+        <div class="name-row" style="display:flex;align-items:center;gap:6px;">
+          <input type="checkbox" class="agent-chk" data-id="${a.id}" ${isChecked} style="margin:0;">
+          <span class="name" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(a.display)}</span>
+          <span class="badge ${a.online === false ? "offline" : "online"}">${a.online === false ? "OFF" : "ON"}</span>
+        </div>
+        <div class="sub" style="margin-left:22px;font-size:11px;opacity:0.7;">hop=${a.hop || 0} ${escapeHtml((a.info && a.info.system) || "")}</div>
+        <div class="bars" style="margin-left:22px;">
+          <div class="bar" title="cpu ${cpu}%"><i style="width:${cpu}%"></i></div>
+          <div class="bar" title="ram ${ram}%"><i style="width:${ram}%;background:var(--warn)"></i></div>
+        </div>`;
+
+      const chk = item.querySelector(".agent-chk");
+      chk.onclick = (e) => {
+        e.stopPropagation();
+        toggleCheck(a.id, chk.checked);
+      };
+
+      item.onclick = (e) => {
+        state.selected = a.id;
+        renderTree();
+        renderHeader();
+        refreshFiles();
+      };
+
+      item.ondblclick = () => {
+        const nick = prompt("Rename Host Nickname:", a.display);
+        if (nick !== null) {
+          api("/api/nick", { method: "POST", body: JSON.stringify({ agent: a.id, nick: nick.trim() }) });
+        }
+      };
+
+      treeEl.appendChild(item);
+      walk(a.id, depth + 1);
+    }
+  }
+
+  walk("__root__", 0);
+}
+
 function renderAgents() {
+  renderTree();
   const list = $("agent-list");
+  if (!list) return;
   list.innerHTML = "";
   $("agent-count").textContent =
     `${state.agents.size} HOST${state.agents.size === 1 ? "" : "S"}`;
@@ -2040,3 +2151,21 @@ function humanSize(bytes) {
 /* ------------------------------------------------------------------ */
 
 if (state.token) start(); else $("login").classList.remove("hidden");
+
+  if ($("sel-all")) $("sel-all").onchange = (e) => selectAll(e.target.checked);
+  if ($("sel-mode")) $("sel-mode").onchange = () => updateSelBar();
+  if ($("sel-run")) $("sel-run").onclick = () => {
+    const cmd = prompt("Command to run on selected agents:");
+    if (cmd) bulk("run", { cmd });
+  };
+  if ($("sel-push")) $("sel-push").onclick = () => bulk("push");
+  if ($("sel-restart")) $("sel-restart").onclick = () => confirm("Restart selected agents?") && bulk("restart");
+  if ($("sel-uninstall")) $("sel-uninstall").onclick = () => confirm("Uninstall selected agents?") && bulk("uninstall");
+  if ($("sel-purge")) $("sel-purge").onclick = () => confirm("Purge selected agents? Final.") && bulk("purge");
+  if ($("lan-btn")) $("lan-btn").onclick = () => {
+    if (state.selected) {
+      sendAgentCommand(state.selected, "lan.scan");
+    } else {
+      alert("Select an agent first to trigger LAN scan");
+    }
+  };

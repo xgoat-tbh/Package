@@ -46,6 +46,14 @@ class AgentSession:
         self.link_ok = False
         self.online = True
 
+        self.parent = ""
+        self.hop = 0
+        self.parent_ip = ""
+        self.mac = ""
+        self.subnet = ""
+        self.group = ""
+        self.health: dict[str, Any] = {}
+
     @property
     def display(self) -> str:
         return self.nick or self.name
@@ -73,6 +81,13 @@ class AgentSession:
             "link_ok": self.link_ok,
             "persistence": self.persistence,
             "online": self.online,
+            "parent": self.parent,
+            "hop": self.hop,
+            "parent_ip": self.parent_ip,
+            "mac": self.mac,
+            "subnet": self.subnet,
+            "group": self.group,
+            "health": self.health,
         }
 
 
@@ -91,7 +106,18 @@ class Hub:
         self._client: MqttClient | None = None
         self.relay_up = False
         self._running = True
+        self._dirty = False
+        self._outbox: list[tuple[str, dict[str, Any]]] = []
+
         self._load_db()
+        threading.Thread(target=self._flush_db_loop, name="hub-db-flush", daemon=True).start()
+
+    def _flush_db_loop(self) -> None:
+        while self._running:
+            time.sleep(5)
+            if self._dirty:
+                self._dirty = False
+                self._save_db()
 
     def _load_db(self) -> None:
         """Load known agents from local JSON database on controller start."""
@@ -117,6 +143,13 @@ class Hub:
                         session.connected_at = item.get("connected_at", 0)
                         session.link_ok = False
                         session.online = False
+                        session.parent = item.get("parent", "")
+                        session.hop = int(item.get("hop") or 0)
+                        session.parent_ip = item.get("parent_ip", "")
+                        session.mac = item.get("mac", "")
+                        session.subnet = item.get("subnet", "")
+                        session.group = item.get("group", "")
+                        session.health = item.get("health", {})
                         self.agents[agent_id] = session
             except Exception:
                 pass
@@ -137,11 +170,7 @@ class Hub:
     # ------------------------------------------------------------------
 
     def agent_folder(self, agent_id: str) -> str:
-        """Folder where this agent's received files live.
-
-        Keyed on the *hostname* rather than the nickname so renaming an agent
-        does not orphan everything it already sent.
-        """
+        """Folder where this agent's received files live."""
         agent = self.agents.get(agent_id)
         folder = os.path.join(self.received_root, safe_name(agent.name if agent else agent_id))
         os.makedirs(folder, exist_ok=True)
@@ -192,7 +221,29 @@ class Hub:
             if not agent:
                 return False
             agent.nick = nick
-            self._save_db()
+            self._dirty = True
+            data = agent.to_dict()
+        self.publish({"type": "agent", "agent": data})
+        return True
+
+    def rename_many(self, targets: list[str], pattern: str) -> None:
+        with self._lock:
+            for idx, agent_id in enumerate(targets, start=1):
+                agent = self.agents.get(agent_id)
+                if not agent:
+                    continue
+                nick = pattern.replace("{n}", str(idx)).replace("{host}", agent.name)
+                agent.nick = nick
+                self.publish({"type": "agent", "agent": agent.to_dict()})
+            self._dirty = True
+
+    def set_group(self, agent_id: str, group: str) -> bool:
+        with self._lock:
+            agent = self.agents.get(agent_id)
+            if not agent:
+                return False
+            agent.group = group
+            self._dirty = True
             data = agent.to_dict()
         self.publish({"type": "agent", "agent": data})
         return True
@@ -211,45 +262,91 @@ class Hub:
                 self.publish({"type": "agent_offline", "id": agent_id, "agent": agent.to_dict()})
         if went_offline:
             with self._lock:
-                self._save_db()
+                self._dirty = True
         return went_offline
+
+    def resolve_targets(self, spec: Any) -> list[str]:
+        if isinstance(spec, list):
+            return [a for a in spec if a in self.agents]
+        if spec == "online":
+            return [a.id for a in self.all() if a.online]
+        if isinstance(spec, str) and spec.startswith("group:"):
+            want = spec.split(":", 1)[1]
+            return [a.id for a in self.all() if a.group == want]
+        return list(self.agents)
+
+    def tree(self) -> list[dict[str, Any]]:
+        nodes = {a.id: {**a.to_dict(), "children": []} for a in self.all()}
+        roots = []
+        for node in nodes.values():
+            parent_id = "agent:" + node.get("parent", "")
+            parent = nodes.get(parent_id)
+            (parent["children"] if parent and parent is not node else roots).append(node)
+        return roots
 
     # ------------------------------------------------------------------
     # Sending
     # ------------------------------------------------------------------
 
-    def send(self, agent_id: str, message: dict[str, Any]) -> bool:
-        """Seal and publish a message to one agent."""
+    def send(self, agent_id: str, message: dict[str, Any]) -> str:
+        """Send or queue message for agent. Returns 'sent', 'queued', or 'missing'."""
         agent = self.agents.get(agent_id)
-        if not agent or not self._client or not self._client.alive:
-            return False
+        if not agent:
+            return "missing"
+        if not self._client or not self._client.alive:
+            self._enqueue(agent_id, message)
+            return "queued"
         try:
             self._client.publish(config.topic_down(agent.remote_id),
                                  self.codec.encode(message), qos=1)
-            return True
+            return "sent"
         except Exception:
-            return False
+            self._enqueue(agent_id, message)
+            return "queued"
+
+    def _enqueue(self, agent_id: str, message: dict[str, Any]) -> None:
+        self._outbox.append((agent_id, message))
+        if len(self._outbox) > 5000:
+            self._outbox = self._outbox[-5000:]
+
+    def flush_outbox(self) -> int:
+        if not self._client or not self._client.alive or not self._outbox:
+            return 0
+        flushed = 0
+        pending = list(self._outbox)
+        self._outbox.clear()
+        for agent_id, message in pending:
+            res = self.send(agent_id, message)
+            if res == "sent":
+                flushed += 1
+        return flushed
 
     def broadcast(self, message: dict[str, Any]) -> int:
         """Send a message to every connected agent."""
-        return sum(1 for agent_id in list(self.agents) if self.send(agent_id, message))
+        return sum(1 for agent_id in list(self.agents) if self.send(agent_id, message) == "sent")
 
     def send_chunks(self, agent_id: str, kind: str, payload: bytes,
-                    filename: str = "", destination: str = "") -> int:
-        """Send a chunked payload, returning the number of chunks."""
+                    filename: str = "", destination: str = "") -> dict[str, Any]:
+        """Send a chunked payload, returning a summary dict."""
         transfer = os.urandom(4).hex()
         parts = protocol.chunk(payload, transfer)
         digest = hashlib.sha256(payload).hexdigest()
+        sent_count = 0
         for index, part in enumerate(parts):
             message: dict[str, Any] = {"t": kind, "name": filename,
                                        "dest": destination, **part}
             if kind == "update":
                 message["sha"] = digest
                 message["proto"] = 1
-            self.send(agent_id, message)
+            status = self.send(agent_id, message)
+            if status == "sent":
+                sent_count += 1
             if len(parts) > 4 and index % 4 == 0:
                 time.sleep(0.01)
-        return len(parts)
+        return {
+            "chunks": len(parts),
+            "status": "sent" if sent_count == len(parts) else "queued"
+        }
 
     # ------------------------------------------------------------------
     # Receiving
@@ -278,7 +375,7 @@ class Hub:
             agent.online = False
             agent.link_ok = False
             self.publish({"type": "agent_offline", "id": agent_id, "agent": agent.to_dict()})
-            self._save_db()
+            self._dirty = True
             return
         elif kind == "out":
             if not agent.link_ok:
@@ -319,7 +416,14 @@ class Hub:
         agent.info = message.get("info", agent.info)
         agent.admin = bool(message.get("admin", agent.admin))
         agent.persistence = message.get("persistence", agent.persistence)
-        self._save_db()
+        agent.parent = message.get("parent", agent.parent)
+        agent.hop = int(message.get("hop") or 0)
+        agent.parent_ip = message.get("parent_ip", agent.parent_ip)
+        agent.mac = message.get("mac", agent.mac)
+        agent.subnet = message.get("subnet", agent.subnet)
+        agent.group = message.get("group", agent.group)
+        agent.health = message.get("health", agent.health)
+        self._dirty = True
 
         if is_new:
             self.publish({"type": "agent_new", "agent": agent.to_dict()})
@@ -359,12 +463,18 @@ class Hub:
         while self._running:
             for host, port, use_tls in config.broker_order():
                 try:
-                    client = MqttClient(random_client_id("syspy-c"), self._on_message)
-                    client.connect(host, port, use_tls)
+                    client = MqttClient(config.short_id() + "-c", self._on_message)
+                    client.connect(
+                        host, port, use_tls,
+                        clean_session=False,
+                        will_topic=config.topic_up("controller"),
+                        will_payload=self.codec.encode({"t": "bye"}),
+                    )
                     client.subscribe(config.ROOM + "/up/+", qos=1)
                     self._client = client
                     self.relay_up = True
                     self.publish({"type": "relay", "up": True, "broker": f"{host}:{port}"})
+                    self.flush_outbox()
                     while client.alive and self._running:
                         time.sleep(1)
                     self.relay_up = False

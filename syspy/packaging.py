@@ -13,7 +13,7 @@ MANIFEST_NAME = "syspy-manifest.json"
 
 #: Files and folders that make up a deployable agent build.
 BUNDLE_FILES = ("agent.py", "bootstrap.py")
-BUNDLE_DIRS = ("syspy",)
+BUNDLE_DIRS = ("syspy", "install")
 
 SKIP_DIRS = {"__pycache__", ".git", ".idea", ".vscode", "received", "dist"}
 SKIP_SUFFIXES = (".pyc", ".pyo")
@@ -38,7 +38,7 @@ def _iter_files(root: str) -> Iterable[tuple[str, str]]:
                 yield full, os.path.relpath(full, root).replace(os.sep, "/")
 
 
-def build_zip(root: str) -> bytes:
+def build_zip(root: str, extra: dict[str, bytes] | None = None) -> bytes:
     """Return a zip archive of the deployable agent bundle."""
     buffer = io.BytesIO()
     manifest: dict[str, str] = {}
@@ -49,6 +49,9 @@ def build_zip(root: str) -> bytes:
                 data = handle.read()
             manifest[name] = hashlib.sha256(data).hexdigest()
             archive.writestr(name, data)
+        for name, blob in (extra or {}).items():
+            manifest[name] = hashlib.sha256(blob).hexdigest()
+            archive.writestr(name, blob)
         archive.writestr(MANIFEST_NAME, json.dumps(manifest, indent=1).encode("utf-8"))
 
     return buffer.getvalue()

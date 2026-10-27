@@ -27,6 +27,7 @@ PACKET_DISCONNECT = 0xE0
 # Same values, but used when *reading* (already shifted down).
 TYPE_CONNACK = 2
 TYPE_PUBLISH = 3
+TYPE_PUBACK = 4
 TYPE_SUBACK = 9
 TYPE_PINGRESP = 13
 
@@ -58,6 +59,7 @@ class MqttClient:
         self._packet_id = 0
         self._alive = False
         self._keepalive = config.MQTT_KEEPALIVE
+        self._pending: dict[int, tuple[str, bytes, float, int]] = {}
 
     # -- connection ------------------------------------------------------
 
@@ -65,7 +67,8 @@ class MqttClient:
     def alive(self) -> bool:
         return self._alive and self._sock is not None
 
-    def connect(self, host: str, port: int, use_tls: bool, timeout: float = 12.0) -> None:
+    def connect(self, host: str, port: int, use_tls: bool, timeout: float = 12.0,
+                clean_session: bool = True, will_topic: str = "", will_payload: bytes = b"") -> None:
         """Open the socket and perform the MQTT handshake."""
         sock = socket.create_connection((host, port), timeout=timeout)
         if use_tls:
@@ -74,12 +77,22 @@ class MqttClient:
         sock.settimeout(90)
         self._sock = sock
 
+        flags = 0x02 if clean_session else 0x00
+        tail = b""
+        if will_topic:
+            flags |= 0x04
+            encoded_will = will_topic.encode("utf-8")
+            tail = (struct.pack(">H", len(encoded_will)) + encoded_will
+                    + struct.pack(">H", len(will_payload)) + will_payload)
+
         identifier = self.client_id.encode("ascii")
         payload = (
-            b"\x00\x04MQTT\x04\x02"
+            b"\x00\x04MQTT\x04"
+            + bytes([flags])
             + struct.pack(">H", self._keepalive)
             + struct.pack(">H", len(identifier))
             + identifier
+            + tail
         )
         self._send(PACKET_CONNECT, payload)
         header, body = self._read_packet()
@@ -90,6 +103,7 @@ class MqttClient:
         self._alive = True
         threading.Thread(target=self._read_loop, name="mqtt-read", daemon=True).start()
         threading.Thread(target=self._ping_loop, name="mqtt-ping", daemon=True).start()
+        threading.Thread(target=self._retry_loop, name="mqtt-retry", daemon=True).start()
 
     def disconnect(self) -> None:
         self._alive = False
@@ -116,6 +130,7 @@ class MqttClient:
         if qos:
             self._packet_id = self._packet_id % 65535 + 1
             body += struct.pack(">H", self._packet_id)
+            self._pending[self._packet_id] = (topic, payload, time.time(), 0)
         self._send(PACKET_PUBLISH | (qos << 1), body + payload)
 
     # -- internals -------------------------------------------------------
@@ -162,6 +177,10 @@ class MqttClient:
                 kind = header >> 4
                 if kind == TYPE_PUBLISH:
                     self._handle_publish(header, body)
+                elif kind == TYPE_PUBACK:
+                    if len(body) >= 2:
+                        pid = struct.unpack(">H", body[:2])[0]
+                        self._pending.pop(pid, None)
                 elif kind == TYPE_PINGRESP:
                     continue
         except Exception:
@@ -183,6 +202,21 @@ class MqttClient:
             self._on_message(topic, body[cursor:])
         except Exception:
             pass
+
+    def _retry_loop(self) -> None:
+        while self._alive:
+            time.sleep(2)
+            now = time.time()
+            for pid, (topic, payload, when, tries) in list(self._pending.items()):
+                if now - when < 5 or tries >= 4:
+                    if tries >= 4:
+                        self._pending.pop(pid, None)
+                    continue
+                encoded = topic.encode("utf-8")
+                body = (struct.pack(">H", len(encoded)) + encoded
+                        + struct.pack(">H", pid) + payload)
+                self._send(PACKET_PUBLISH | 0x02, body)
+                self._pending[pid] = (topic, payload, now, tries + 1)
 
     def _ping_loop(self) -> None:
         while self._alive:

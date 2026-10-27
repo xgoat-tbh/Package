@@ -26,9 +26,9 @@ STATIC_FILES = ("index.html", "app.js", "style.css")
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SysPy controller")
-    parser.add_argument("--host", default=config.DASHBOARD_HOST,
+    parser.add_argument("--host", default=os.environ.get("SYSPY_HOST", config.DASHBOARD_HOST),
                         help="interface to bind (default: loopback only)")
-    parser.add_argument("--port", type=int, default=config.DASHBOARD_PORT)
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT") or config.DASHBOARD_PORT))
     parser.add_argument("--password", default="", help="dashboard password")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--stopall", "--stop", action="store_true",
@@ -92,9 +92,13 @@ def stop_all_controllers(port: int = config.DASHBOARD_PORT) -> int:
             pass
     else:
         import subprocess
+        ppid = os.getppid() if hasattr(os, "getppid") else 0
         try:
-            subprocess.run("pkill -9 -f 'controller.py'", shell=True, capture_output=True)
-            killed += 1
+            out = subprocess.run("pgrep -f 'controller.py'", shell=True,
+                                 capture_output=True, text=True).stdout.split()
+            for pid in {int(p) for p in out if p.isdigit()} - {my_pid, ppid}:
+                subprocess.run(["kill", "-9", str(pid)], capture_output=True)
+                killed += 1
         except Exception:
             pass
 
@@ -160,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     print("  waiting for agents...  (ctrl+c to stop)")
     print()
 
-    if not args.no_browser:
+    if not args.no_browser and not os.environ.get("RENDER"):
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
 
     try:

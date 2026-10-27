@@ -159,7 +159,7 @@ def _windows_interfaces() -> list:
             uni = uni.contents.Next
     # Prefer IPv4 per adapter: IPv6-only entries just duplicate the host.
     v4_ifaces = {a["ifindex"] for a in out if a["family"] == "inet"}
-    return [a for a in out if a["family"] == " inet" or a["ifindex"] not in v4_ifaces]
+    return [a for a in out if a["family"] == "inet" or a["ifindex"] not in v4_ifaces]
 
 
 def _posix_interfaces() -> list:
@@ -214,9 +214,29 @@ def local_interfaces() -> list:
 
 
 def local_subnets() -> list:
-    """[(network_string, interface_dict), ...] for every usable interface."""
+    """[(network_string, interface_dict), ...] for every usable IPv4 interface."""
     seen, out = set(), []
     for iface in local_interfaces():
+        if iface.get("family") != "inet":
+            continue
+        try:
+            net = ipaddress.ip_network("%s/%s" % (iface["ip"], iface["prefix"]), strict=False)
+        except Exception:
+            continue
+        key = str(net)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((key, iface))
+    return out
+
+
+def local_subnets6() -> list:
+    """[(network_string, interface_dict), ...] for usable IPv6 interfaces."""
+    seen, out = set(), []
+    for iface in local_interfaces():
+        if iface.get("family") != "inet6":
+            continue
         try:
             net = ipaddress.ip_network("%s/%s" % (iface["ip"], iface["prefix"]), strict=False)
         except Exception:
@@ -242,13 +262,14 @@ def local_subnet() -> str:
 
 def subnet_hosts(network: str, limit: int = MAX_HOSTS):
     net = ipaddress.ip_network(network, strict=False)
+    if net.version == 6:
+        return (str(ipaddress.ip_address(int(net.network_address) + i)) for i in range(1, min(limit, net.num_addresses - 1)))
     if net.num_addresses > limit + 2:
         net = ipaddress.ip_network(
             "%s/%s" % (str(net.network_address), max(24, 32 - (limit.bit_length() - 1))),
             strict=False,
         )
-    for host in net.hosts():
-        yield str(host)
+    return (str(host) for host in net.hosts())
 
 
 def same_subnet(ip: str, network: str) -> bool:
@@ -335,7 +356,7 @@ def classify(ports) -> str:
     ports = set(ports or ())
     if 445 in ports and (135 in ports or 139 in ports):
         return "windows"
-    if 3389 in ports or 5985 in ports:
+    if 3389 in ports or 5985 in ports or 5986 in ports:
         return "windows"
     if 22 in ports:
         return "linux"
@@ -495,11 +516,13 @@ def discover(timeout: float = 3.0, force: bool = False) -> dict:
         if banner and not rec.get("hostname"):
             rec["hostname"] = banner[:60]
 
-    for ip in list(records):
-        if IS_WINDOWS and not records[ip].get("hostname"):
-            name = netbios_name(ip)
-            if name:
-                records[ip]["hostname"] = name
+    if IS_WINDOWS:
+        pending = [ip for ip in list(records) if not records[ip].get("hostname")]
+        if pending:
+            with ThreadPoolExecutor(max_workers=32) as pool:
+                for ip, name in zip(pending, pool.map(netbios_name, pending)):
+                    if name:
+                        records[ip]["hostname"] = name
 
     for ip, rec in records.items():
         rec["kind"] = classify(rec.get("ports"))

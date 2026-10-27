@@ -38,10 +38,13 @@ def interpreter() -> str:
     return private_python() or "python"
 
 
-def ensure() -> str | None:
+def ensure(force: bool = False) -> str | None:
     """Copy the current interpreter and its stdlib next to the agent."""
     if getattr(sys, "frozen", False):
         return runtime_directory()
+    if not force and os.environ.get("SYSPY_VENDOR_RUNTIME") != "1":
+        if os.path.exists(sys.executable) and sys.executable.lower().endswith(("python.exe", "pythonw.exe")):
+            return runtime_directory()
 
     home = os.path.dirname(os.path.abspath(sys.executable))
     target = runtime_directory()

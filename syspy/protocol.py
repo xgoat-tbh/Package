@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+import zlib
 from typing import Any, Optional
 
 from . import config
@@ -57,10 +58,12 @@ class Reassembler:
 
         decoded = base64.b64decode(message["data"])
         with self._lock:
-            self._parts.setdefault(transfer, {})[index] = decoded
+            bucket = self._parts.setdefault(transfer, {})
+            if index in bucket:                 # QoS-1 redelivery
+                return None
+            bucket[index] = decoded
             self._meta[transfer] = (total, now)
 
-            bucket = self._parts[transfer]
             if len(bucket) < total:
                 self._expire(now)
                 return None
@@ -68,7 +71,13 @@ class Reassembler:
             data = b"".join(bucket[i] for i in range(total))
             self._parts.pop(transfer, None)
             self._meta.pop(transfer, None)
-            return data
+
+        if message.get("z"):
+            try:
+                data = zlib.decompress(data)
+            except zlib.error:
+                pass
+        return data
 
     def _expire(self, now: float) -> None:
         stale = [k for k, (_, seen) in self._meta.items() if now - seen > self._timeout]
@@ -85,15 +94,17 @@ class Reassembler:
         return received, total
 
 
-def chunk(payload: bytes, transfer: str, chunk_size: int = config.CHUNK_SIZE) -> list[dict[str, Any]]:
+def chunk(payload: bytes, transfer: str, chunk_size: int = config.CHUNK_SIZE, compress: bool = False) -> list[dict[str, Any]]:
     """Split ``payload`` into a list of chunk messages."""
-    total = max(1, (len(payload) + chunk_size - 1) // chunk_size)
+    data = zlib.compress(payload, 6) if compress else payload
+    total = max(1, (len(data) + chunk_size - 1) // chunk_size)
     return [
         {
             "xid": transfer,
             "part": index,
             "total": total,
-            "data": base64.b64encode(payload[index * chunk_size:(index + 1) * chunk_size]).decode("ascii"),
+            "data": base64.b64encode(data[index * chunk_size:(index + 1) * chunk_size]).decode("ascii"),
+            **({"z": 1} if compress else {}),
         }
         for index in range(total)
     ]

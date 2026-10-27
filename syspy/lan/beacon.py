@@ -9,7 +9,9 @@ fetches this host's bundle over plain HTTP and installs itself from it.
 """
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 import os
 import socket
 import threading
@@ -46,6 +48,9 @@ class Beacon:
             "ver": config.PRODUCT_VERSION,
             "hop": config.hop(),
             "parent": config.parent_id(),
+            "mac": config.mac(),
+            "subnet": config.subnet(),
+            "group": config.group(),
             "ts": int(time.time()),
         }
         if extra:
@@ -277,6 +282,8 @@ class _KitHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.server.kit_bytes())
             except Exception as exc:
                 return self._send(500, str(exc).encode(), "text/plain")
+        if path in ("/py.zip", "/runtime.zip"):
+            return self._send(200, self.server.runtime_zip(), "application/zip")
         if path == "/deploy.json":
             return self._send(200, json.dumps(self.server.deploy_overlay()).encode(),
                               "application/json")
@@ -321,7 +328,19 @@ class KitServer:
                     return handle.read()
             except OSError:
                 continue
-        return b"# i.ps1 missing from bundle"
+        return b"param($Kit) powershell -NoProfile -ExecutionPolicy Bypass -File \"$Kit\\install\\i.ps1\" -Kit $Kit"
+
+    def runtime_zip(self) -> bytes:
+        runtime = os.path.join(self.bundle_root, "runtime")
+        if not os.path.isdir(runtime):
+            return b""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for current, _dirs, files in os.walk(runtime):
+                for name in files:
+                    full = os.path.join(current, name)
+                    archive.write(full, os.path.relpath(full, runtime))
+        return buffer.getvalue()
 
     def kit_bytes(self) -> bytes:
         from .. import packaging
@@ -351,6 +370,7 @@ class KitServer:
         self._http.daemon_threads = True
         self._http.kit_bytes = self.kit_bytes
         self._http.kit_url = self.kit_url
+        self._http.runtime_zip = self.runtime_zip
         self._http.deploy_overlay = self.deploy_overlay
         self._http.install_script = self.install_script
         threading.Thread(target=self._http.serve_forever, name="syspy-kit",

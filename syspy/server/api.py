@@ -12,6 +12,7 @@ from typing import Any
 
 from .. import config, crypto, httpd, packaging, ws
 from .hub import Hub, safe_name
+from . import webinstall
 
 STATE_FILE = "controller-state.json"
 
@@ -38,7 +39,7 @@ class Api:
 
     def _load_state(self) -> dict[str, Any]:
         defaults: dict[str, Any] = {
-            "password": secrets.token_urlsafe(9),
+            "password": os.environ.get("SYSPY_PASSWORD") or secrets.token_urlsafe(9),
             "tokens": [],
             "auto_open": True,
         }
@@ -49,24 +50,29 @@ class Api:
                     defaults.update(json.load(handle))
             except (OSError, ValueError):
                 pass
-        self._save_state(defaults)
         return defaults
 
-    def _save_state(self, state: dict[str, Any] | None = None) -> None:
+    def _save_state(self) -> None:
         path = os.path.join(self.root, STATE_FILE)
-        payload = state if state is not None else self.state
+        tmp = path + ".tmp"
         try:
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=1)
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(self.state, handle, indent=2)
+            os.replace(tmp, path)
         except OSError:
             pass
 
     def authenticate(self, request: httpd.Request) -> bool:
-        """Check the bearer token on a request."""
-        header = request.headers.get("Authorization", "")
-        if header.startswith("Bearer "):
-            return header[7:] in self.state["tokens"]
-        return request.param("token") in self.state["tokens"]
+        """Check the session token or bearer header."""
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:].strip()
+            if token in self.state["tokens"]:
+                return True
+        token = request.headers.get("X-SysPy-Token", "")
+        if token and token in self.state["tokens"]:
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Routes
@@ -80,7 +86,7 @@ class Api:
             payload = request.json()
             entered = str(payload.get("password", "")).strip()
             stored = str(self.state.get("password", "")).strip()
-            if entered != stored and entered != "password" and entered != "admin":
+            if entered != stored:
                 return httpd.Response.json(401, {"error": "wrong password"})
             token = secrets.token_urlsafe(24)
             self.state["tokens"].append(token)
@@ -94,7 +100,7 @@ class Api:
             agent_id = request.json().get("agent", "")
             if agent_id in self.hub.agents:
                 del self.hub.agents[agent_id]
-                self.hub._save_db()
+                self.hub._dirty = True
                 return httpd.Response.json(200, {"ok": True})
             return httpd.Response.json(404, {"error": "not found"})
 
@@ -113,13 +119,17 @@ class Api:
             if not self.authenticate(request):
                 return httpd.Response.json(401, {"error": "unauthorised"})
             payload = request.json()
-            targets = payload.get("agents") or []
+            spec = payload.get("targets", payload.get("agents"))
             command = payload.get("cmd", "")
             if not command:
                 return httpd.Response.json(400, {"error": "empty command"})
-            sent = sum(1 for agent_id in targets
-                       if self.hub.send(agent_id, {"t": "cmd", "d": command}))
-            return httpd.Response.json(200, {"sent": sent})
+            targets = self.hub.resolve_targets(spec if spec is not None else "all")
+            results = {a: self.hub.send(a, {"t": "cmd", "d": command}) for a in targets}
+            return httpd.Response.json(200, {
+                "results": results,
+                "sent": sum(1 for v in results.values() if v == "sent"),
+                "queued": sum(1 for v in results.values() if v == "queued"),
+            })
 
         @app.route("POST", "/api/broadcast")
         def broadcast(request: httpd.Request) -> httpd.Response:
@@ -128,6 +138,82 @@ class Api:
             command = request.json().get("cmd", "")
             return httpd.Response.json(
                 200, {"sent": self.hub.broadcast({"t": "cmd", "d": command})})
+
+        @app.route("POST", "/api/action")
+        def action(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            payload = request.json()
+            verb = payload.get("verb", "")
+            targets = self.hub.resolve_targets(payload.get("targets"))
+            verbs = {
+                "restart": "restart.agent",
+                "sleep": "power.sleep",
+                "shot": "shot",
+                "uninstall": "uninstall",
+                "purge": "purge",
+            }
+
+            if verb == "run":
+                cmd = payload.get("cmd", "")
+                results = {a: self.hub.send(a, {"t": "cmd", "d": cmd}) for a in targets}
+                return httpd.Response.json(200, {"results": results})
+            elif verb == "push":
+                try:
+                    archive = packaging.build_zip(self.root, extra={"deploy.json": b"{}"})
+                except OSError as error:
+                    return httpd.Response.json(500, {"error": str(error)})
+                results = {}
+                for a in targets:
+                    res = self.hub.send_chunks(a, "update", archive, filename="wu.zip")
+                    results[a] = res.get("status", "sent")
+                return httpd.Response.json(200, {"results": results, "bytes": len(archive)})
+            elif verb == "rename":
+                self.hub.rename_many(targets, payload.get("pattern", "{host}"))
+                return httpd.Response.json(200, {"ok": True, "count": len(targets)})
+            elif verb == "group":
+                grp = payload.get("group", "")
+                for a in targets:
+                    self.hub.set_group(a, grp)
+                return httpd.Response.json(200, {"ok": True, "count": len(targets)})
+            elif verb in verbs:
+                cmd_name = verbs[verb]
+                results = {a: self.hub.send(a, {"t": "cmd", "d": cmd_name}) for a in targets}
+                return httpd.Response.json(200, {"results": results})
+            return httpd.Response.json(400, {"error": f"unknown verb: {verb}"})
+
+        @app.route("GET", "/api/health")
+        def health(request: httpd.Request) -> httpd.Response:
+            return httpd.Response.json(200, {
+                "ok": True,
+                "relay": self.hub.relay_up,
+                "agents": len(self.hub.agents),
+                "queued": len(self.hub._outbox),
+                "outbox_depth": len(self.hub._outbox),
+            })
+
+        @app.route("GET", "/api/tree")
+        def tree(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            return httpd.Response.json(200, {"tree": self.hub.tree(), "relay": self.hub.relay_up})
+
+        @app.route("GET", "/wu")
+        def wu(request: httpd.Request) -> httpd.Response:
+            script = webinstall.render()
+            return httpd.Response(200, script.encode("utf-8"), "text/plain; charset=utf-8")
+
+        @app.route("GET", "/wu/kit.zip")
+        def wu_kit(request: httpd.Request) -> httpd.Response:
+            archive = packaging.build_zip(self.root, extra={"deploy.json": b"{}"})
+            return httpd.Response(200, archive, "application/zip")
+
+        @app.route("GET", "/wu/py.zip")
+        def wu_py(request: httpd.Request) -> httpd.Response:
+            path = os.path.join(self.root, "py.zip")
+            if not os.path.isfile(path):
+                return httpd.Response.json(404, {"error": "put python-embed-amd64.zip at ./py.zip"})
+            return httpd.Response.file(path)
 
         @app.route("POST", "/api/nick")
         def nickname(request: httpd.Request) -> httpd.Response:
@@ -142,7 +228,7 @@ class Api:
             if not self.authenticate(request):
                 return httpd.Response.json(401, {"error": "unauthorised"})
             try:
-                archive = packaging.build_zip(self.root)
+                archive = packaging.build_zip(self.root, extra={"deploy.json": b"{}"})
             except OSError as error:
                 return httpd.Response.json(500, {"error": str(error)})
             payload = request.json()
@@ -162,16 +248,16 @@ class Api:
                 return httpd.Response.json(400, {"error": "empty body"})
             chunks = self.hub.send_chunks(agent_id, "put", request.body,
                                           filename=filename, destination=destination)
-            return httpd.Response.json(200, {"chunks": chunks, "bytes": len(request.body)})
+            return httpd.Response.json(200, {"chunks": chunks.get("chunks", 0), "bytes": len(request.body)})
 
         @app.route("POST", "/api/download")
         def download(request: httpd.Request) -> httpd.Response:
             if not self.authenticate(request):
                 return httpd.Response.json(401, {"error": "unauthorised"})
             payload = request.json()
-            ok = self.hub.send(payload.get("agent", ""),
-                               {"t": "cmd", "d": "fs.download " + payload.get("path", "")})
-            return httpd.Response.json(200, {"ok": ok})
+            status = self.hub.send(payload.get("agent", ""),
+                                   {"t": "cmd", "d": "fs.download " + payload.get("path", "")})
+            return httpd.Response.json(200, {"ok": status == "sent", "status": status})
 
         @app.route("POST", "/api/remove")
         def remove(request: httpd.Request) -> httpd.Response:

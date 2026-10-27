@@ -198,6 +198,31 @@ def _user_hives():
     return hives
 
 
+def clear_startup_approved() -> list[str]:
+    """Delete StartupApproved entries during uninstall."""
+    if not IS_WINDOWS:
+        return []
+    import winreg
+    from . import config
+
+    names = tuple(config.RUN_VALUE_NAMES) + (config.PRODUCT_NAME + ".cmd",)
+    cleared: list[str] = []
+    for label, hive in _user_hives():
+        for subkey in _APPROVED_SUBKEYS:
+            try:
+                key = winreg.OpenKey(hive, subkey, 0, winreg.KEY_SET_VALUE)
+            except OSError:
+                continue
+            with key:
+                for name in names:
+                    try:
+                        winreg.DeleteValue(key, name)
+                        cleared.append(f"{label}\{name}")
+                    except OSError:
+                        pass
+    return cleared
+
+
 def ensure_startup_approved() -> list[str]:
     if not IS_WINDOWS:
         return []

