@@ -147,7 +147,8 @@ def main(argv: list[str] | None = None) -> int:
 
     api = Api(root)
     if args.password:
-        api.state["password"] = args.password
+        from syspy.server.api import _hash_password
+        api.state["password"] = _hash_password(args.password)
         api._save_state()
 
     try:

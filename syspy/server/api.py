@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -16,6 +18,35 @@ from . import webinstall, runtime_cache
 
 STATE_FILE = "controller-state.json"
 TOKEN_TTL = 60 * 60 * 24 * 14
+SESSION_COOKIE = "syspy_session"
+
+
+def _hash_password(password: str, salt: bytes = b"") -> str:
+    """PBKDF2-SHA256. Stdlib only; the salt travels with the hash."""
+    salt = salt or os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
+    return "pbkdf2$120000$%s$%s" % (salt.hex(), digest.hex())
+
+
+def _same(left: str, right: str) -> bool:
+    """compare_digest raises on non-ASCII str; compare UTF-8 bytes instead."""
+    try:
+        return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+    except (AttributeError, UnicodeError):
+        return left == right
+
+
+def _verify_password(entered: str, stored: str) -> bool:
+    """Accepts a legacy plaintext value so an existing state file still works."""
+    if not stored.startswith("pbkdf2$"):
+        return _same(entered, stored)
+    try:
+        _tag, rounds, salt_hex, want = stored.split("$")
+        digest = hashlib.pbkdf2_hmac("sha256", entered.encode("utf-8"),
+                                     bytes.fromhex(salt_hex), int(rounds))
+        return hmac.compare_digest(digest.hex(), want)
+    except (ValueError, TypeError):
+        return False
 
 
 def _safe_dir(name: str) -> str:
@@ -54,6 +85,7 @@ class Api:
         self.state = self._load_state()
         self.app = httpd.Application()
         self._login_attempts: dict[str, list[float]] = {}
+        self._tickets: dict[str, float] = {}
         self.app.static(os.path.join(os.path.dirname(__file__), "static"))
         self._register_routes()
 
@@ -83,6 +115,10 @@ class Api:
             with open(tmp, "w", encoding="utf-8") as handle:
                 json.dump(self.state, handle, indent=2)
             os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)   # holds the password hash and live tokens
+            except OSError:
+                pass
         except OSError:
             pass
 
@@ -96,13 +132,22 @@ class Api:
         header = request.headers.get("X-SysPy-Token", "")
         if header:
             presented.append(header)
+        # Cookie so <img src="/files/..."> works without a URL token.
+        for part in (request.headers.get("Cookie", "") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == SESSION_COOKIE and value:
+                presented.append(value)
+        # Query token kept for compatibility with an older cached app.js.
+        query_token = request.param("token", "")
+        if query_token:
+            presented.append(query_token)
 
-        for entry in self.state["tokens"]:
+        for entry in self.state.get("tokens", []):
             token = entry["token"] if isinstance(entry, dict) else entry
             issued = entry.get("at", 0) if isinstance(entry, dict) else now
-            if now - issued > TOKEN_TTL:
+            if now - issued > TOKEN_TTL or not isinstance(token, str):
                 continue
-            if token in presented:
+            if any(_same(candidate, token) for candidate in presented if candidate):
                 return True
         return False
 
@@ -115,16 +160,28 @@ class Api:
 
         @app.route("POST", "/api/login")
         def login(request: httpd.Request) -> httpd.Response:
-            ip = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip() or "client"
+            # X-Forwarded-For is client-supplied. Only believe it behind a
+            # proxy that overwrites it, otherwise every request can pick a new
+            # bucket and the limiter does nothing.
+            if os.environ.get("SYSPY_TRUST_PROXY") == "1":
+                ip = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+            else:
+                ip = (request.headers.get("X-Real-IP") or "").strip()
+            ip = ip or "client"
             now = time.time()
             attempts = [t for t in self._login_attempts.get(ip, []) if now - t < 60]
             if len(attempts) >= 10:
                 return httpd.Response.json(429, {"error": "too many attempts, try again later"})
+            if attempts:
+                # Progressive backoff after a failed attempt, capped.
+                pause = min(0.4 * (2 ** len(attempts)), 4.0)
+                if now - attempts[-1] < pause:
+                    return httpd.Response.json(429, {"error": "slow down", "retry_in": round(pause, 1)})
 
             payload = request.json()
             entered = str(payload.get("password", "")).strip()
             stored = str(self.state.get("password", "")).strip()
-            if entered != stored:
+            if not _verify_password(entered, stored):
                 attempts.append(now)
                 self._login_attempts[ip] = attempts
                 return httpd.Response.json(401, {"error": "wrong password"})
@@ -132,12 +189,16 @@ class Api:
                 self._login_attempts.pop(ip, None)
             token = secrets.token_urlsafe(24)
             now_ts = time.time()
+            response = None
             live = [t for t in self.state["tokens"]
                     if isinstance(t, dict) and now_ts - t.get("at", 0) < TOKEN_TTL]
             live.append({"token": token, "at": now_ts})
             self.state["tokens"] = live[-200:]
             self._save_state()
-            return httpd.Response.json(200, {"token": token})
+            response = httpd.Response.json(200, {"token": token})
+            response.headers["Set-Cookie"] = (
+                f"{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={TOKEN_TTL}")
+            return response
 
         @app.route("POST", "/api/agent/delete")
         def delete_agent(request: httpd.Request) -> httpd.Response:
@@ -228,6 +289,16 @@ class Api:
                 return httpd.Response.json(200, {"results": results})
             return httpd.Response.json(400, {"error": f"unknown verb: {verb}"})
 
+        @app.route("POST", "/api/logout")
+        def logout(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            self.state["tokens"] = []
+            self._save_state()
+            response = httpd.Response.json(200, {"ok": True})
+            response.headers["Set-Cookie"] = f"{SESSION_COOKIE}=; Path=/; Max-Age=0"
+            return response
+
         @app.route("GET", "/api/health")
         def health(request: httpd.Request) -> httpd.Response:
             return httpd.Response.json(200, {
@@ -260,6 +331,17 @@ class Api:
             status = self.hub.send(request.param("agent", ""),
                                    {"t": "cmd", "d": "log.tail 200"})
             return httpd.Response.json(200, {"status": status})
+
+        @app.route("POST", "/api/ws-ticket")
+        def ws_ticket(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            ticket = secrets.token_urlsafe(18)
+            self._tickets[ticket] = time.time() + 30
+            for key, expiry in list(self._tickets.items()):
+                if expiry < time.time():
+                    self._tickets.pop(key, None)
+            return httpd.Response.json(200, {"ticket": ticket})
 
         @app.route("GET", "/api/tree")
         def tree(request: httpd.Request) -> httpd.Response:
@@ -403,6 +485,9 @@ class Api:
 
         @app.route("GET", "/files/{agent}/{name}")
         def serve_file(request: httpd.Request) -> httpd.Response:
+            # Was unauthenticated: the URL alone was the only access control.
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
             params = request.path_params
             folder = os.path.abspath(self.hub.agent_folder(params.get("agent", "")))
             candidate = os.path.abspath(os.path.normpath(os.path.join(folder, params.get("name", ""))))
@@ -424,8 +509,16 @@ class Api:
     # ------------------------------------------------------------------
 
     def _on_socket(self, socket: ws.WebSocket, request: httpd.Request) -> None:
-        token = request.param("token")
-        if token not in self.state["tokens"]:
+        # A ticket is single-use and short-lived, so the long-lived token never
+        # lands in a URL that proxies and browser diagnostics will record.
+        ticket = request.param("ticket")
+        ok = bool(ticket) and self._tickets.pop(ticket, 0) > time.time()
+        if not ok:
+            token = request.param("token")
+            ok = bool(token) and any(
+                (t["token"] if isinstance(t, dict) else t) == token
+                for t in self.state["tokens"])
+        if not ok:
             socket.close(1008)
             return
 

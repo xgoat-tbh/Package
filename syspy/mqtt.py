@@ -31,6 +31,12 @@ TYPE_PUBACK = 4
 TYPE_SUBACK = 9
 TYPE_PINGRESP = 13
 
+#: Refuse absurd packets. The broker never sends more than CHUNK_SIZE plus a
+#: small header, and a 64 MB allocation from a hostile broker is avoidable.
+MAX_PACKET_BYTES = 64 * 1024 * 1024
+#: Outbound QoS1 backlog ceiling before we start dropping the oldest.
+MAX_PENDING = 512
+
 
 def _varint(value: int) -> bytes:
     """Encode an MQTT remaining-length field."""
@@ -143,6 +149,9 @@ class MqttClient:
             self._packet_id = self._packet_id % 65535 + 1
             body += struct.pack(">H", self._packet_id)
             self._pending[self._packet_id] = (topic, payload, time.time(), 0)
+            if len(self._pending) > MAX_PENDING:
+                self._pending.pop(next(iter(self._pending)), None)
+                self.dropped += 1
         self._send(PACKET_PUBLISH | (qos << 1), body + payload)
 
     def publish_wait(self, topic: str, payload: bytes, qos: int = 1,
@@ -202,6 +211,8 @@ class MqttClient:
             if bytes_read >= 4:
                 raise ConnectionError("malformed MQTT packet: remaining length exceeds 4 bytes")
             multiplier *= 128
+        if length > MAX_PACKET_BYTES:
+            raise ConnectionError(f"MQTT packet too large: {length}")
         return header, (self._read_exact(length) if length else b"")
 
     def _read_loop(self) -> None:
@@ -220,8 +231,9 @@ class MqttClient:
                             waiter.set()
                 elif kind == TYPE_PINGRESP:
                     continue
-        except Exception:
-            pass
+        except Exception as error:
+            # Was silent: a protocol error killed the connection with no trace.
+            log.get("mqtt").warning("read loop ended: %s", error)
         self._alive = False
 
     def _handle_publish(self, header: int, body: bytes) -> None:

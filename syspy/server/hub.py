@@ -112,7 +112,7 @@ class Hub:
         self._outbox: list[tuple[str, dict[str, Any]]] = []
         self._roster_sent: dict[str, float] = {}
         self.counters = collections.Counter(
-            {"decrypt_fail": 0, "publish_timeout": 0, "publish_error": 0,
+            {"decrypt_fail": 0, "master_key_fallback": 0, "publish_timeout": 0, "publish_error": 0,
              "outbox_overflow": 0, "ws_drop": 0})
 
         self._load_db()
@@ -399,6 +399,7 @@ class Hub:
         except Exception:
             try:
                 message = self.codec.decode(payload)
+                self.counters["master_key_fallback"] += 1
             except Exception:
                 self.counters["decrypt_fail"] += 1
                 return

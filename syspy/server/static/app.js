@@ -163,14 +163,23 @@ function nextDelay() {
   return _backoff + Math.round(Math.random() * 400);
 }
 
-function connect() {
+async function connect() {
+  try {
+    const _r = await fetch('/api/ws-ticket', {
+      method: 'POST',
+      headers: (typeof token !== 'undefined' && token) ? { Authorization: 'Bearer ' + token } : {},
+    });
+    if (_r.ok) window.__wsTicket = (await _r.json()).ticket;
+  } catch (_e) { /* fall back to the token param */ }
+
   _backoff = 500;
   if (state.socket) {
     try { state.socket.close(); } catch(e) {}
   }
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(
-    `${protocol}//${location.host}/ws?token=${encodeURIComponent(state.token)}`);
+  const socket = new WebSocket(scheme + '//' + location.host + '/ws?ticket=' +
+    encodeURIComponent(window.__wsTicket || '') +
+    (window.__wsTicket ? '' : '&token=' + encodeURIComponent(typeof token !== 'undefined' ? token : '')));
   state.socket = socket;
 
   // Browser keepalive ping every 5 seconds so Render proxy never drops the WebSocket

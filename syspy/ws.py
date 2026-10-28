@@ -20,6 +20,11 @@ OP_CLOSE = 0x8
 OP_PING = 0x9
 OP_PONG = 0xA
 
+# Dashboard frames are small JSON/control messages, not file transfers.
+MAX_FRAME_BYTES = 1 * 1024 * 1024
+_CONTROL_OPCODES = {OP_CLOSE, OP_PING, OP_PONG}
+_ALLOWED_OPCODES = {OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG}
+
 
 def accept_token(client_key: str) -> str:
     """Compute the ``Sec-WebSocket-Accept`` value for a handshake."""
@@ -46,9 +51,18 @@ class WebSocket:
             self.closed = True
             return None
 
+        fin = bool(header[0] & 0x80)
+        reserved = header[0] & 0x70
         opcode = header[0] & 0x0F
         masked = bool(header[1] & 0x80)
         length = header[1] & 0x7F
+
+        # Complete, unfragmented frames only. No extension is negotiated, so
+        # any RSV bit set is a protocol error, and RFC 6455 requires every
+        # browser-to-server frame to be masked.
+        if reserved or not fin or not masked or opcode not in _ALLOWED_OPCODES:
+            self.closed = True
+            return None
 
         try:
             if length == 126:
@@ -56,7 +70,14 @@ class WebSocket:
             elif length == 127:
                 length = struct.unpack(">Q", self._read_exact(8))[0]
 
-            mask = self._read_exact(4) if masked else b"\x00\x00\x00\x00"
+            if length > MAX_FRAME_BYTES:
+                self.closed = True
+                return None
+            if opcode in _CONTROL_OPCODES and length > 125:
+                self.closed = True
+                return None
+
+            mask = self._read_exact(4)
             payload = bytearray(self._read_exact(length))
         except Exception:
             self.closed = True

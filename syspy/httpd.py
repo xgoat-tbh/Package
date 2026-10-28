@@ -46,6 +46,11 @@ CONTENT_TYPES: dict[str, str] = {
     ".zip": "application/zip",
 }
 
+#: Hard request-body ceiling. Uploads go through /api/upload as one body.
+MAX_BODY_BYTES = 256 * 1024 * 1024
+#: Alias kept so external tooling that refers to MAX_REQUEST_BODY still works.
+MAX_REQUEST_BODY = MAX_BODY_BYTES
+
 #: Prefix stripped from request paths before resolving against the static root.
 STATIC_PREFIX = "static/"
 
@@ -197,6 +202,7 @@ class Application:
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "SysPy"
+    timeout = 60          # per-socket; a stalled client cannot pin a thread forever
 
     def log_message(self, *_args: Any) -> None:
         pass
@@ -225,14 +231,40 @@ class _Handler(BaseHTTPRequestHandler):
             self._write(Response.no_content())
             return
 
-        length = int(self.headers.get("Content-Length") or 0)
+        # No chunked decoder here; say so instead of reading a wrong length.
+        if self.headers.get("Transfer-Encoding"):
+            self._write(Response.json(400, {"error": "transfer-encoding unsupported"}))
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = -1
+        if length < 0:
+            self._write(Response.json(400, {"error": "bad Content-Length"}))
+            return
+        if length > MAX_BODY_BYTES:
+            self._write(Response.json(413, {"error": "payload too large",
+                                            "limit": MAX_BODY_BYTES}))
+            return
         body = self.rfile.read(length) if length else b""
+        if len(body) != length:
+            self._write(Response.json(400, {"error": "incomplete request body"}))
+            return""
         request = Request(method, path, parse_qs(parsed.query), self.headers, body)
 
         try:
             response = self.server.app.dispatch(request)  # type: ignore[attr-defined]
+        except (UnicodeDecodeError, ValueError) as error:
+            # json.JSONDecodeError subclasses ValueError.
+            response = Response.json(400, {"error": "invalid request body",
+                                           "detail": str(error)[:120]})
         except Exception:
-            response = Response.json(500, {"error": traceback.format_exc()})
+            # Full traceback to the operator, one line to the client.
+            import logging
+            logging.getLogger("syspy.httpd").error(
+                "%s %s failed", method, path, exc_info=True)
+            detail = traceback.format_exc().strip().splitlines()[-1][:200]
+            response = Response.json(500, {"error": "internal error", "detail": detail})
 
         self._write(response, include_body=method != "HEAD")
 
@@ -251,6 +283,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(response.status)
         for key, value in response.headers.items():
             self.send_header(key, value)
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(response.body)))
         self.end_headers()
         if include_body and response.body:

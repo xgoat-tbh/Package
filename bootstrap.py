@@ -88,9 +88,16 @@ def clean_owned(target: str) -> None:
 
 
 def extract(blob: bytes, target: str) -> None:
-    """Extract a kit zip over ``target``."""
+    """Extract a kit zip over ``target``, manifest-checked first.
+
+    A peer serves this over plain HTTP, so the archive is untrusted input.
+    """
     os.makedirs(target, exist_ok=True)
+    from syspy import packaging
     with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        ok, reason = packaging.verify_manifest_zip(archive)
+        if not ok:
+            raise ValueError(f"kit rejected: {reason}")
         archive.extractall(target)
 
 

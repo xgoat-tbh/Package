@@ -1029,8 +1029,18 @@ def execute(agent, line: str) -> None:
     if not line:
         return
     name, _, argument = line.partition(" ")
+
+    # "!" forces the shell. An unknown bare word is now reported instead of
+    # being executed, so a typo no longer looks like a working command.
+    if name.startswith("!"):
+        shell(agent, line[1:].strip())
+        return
+
     handler = resolve(name)
     if handler is None:
+        if " " not in line and "." not in name:
+            agent.reply(f"unknown command: {name}  (use !{name} for the shell)")
+            return
         shell(agent, line)
         return
     if hasattr(agent, "health") and agent.health:
