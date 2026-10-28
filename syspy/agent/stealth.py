@@ -109,16 +109,16 @@ def lock_path() -> str:
             directory = os.path.join(base, config.WINDOWS_SUBDIR)
             try:
                 os.makedirs(directory, exist_ok=True)
-                return os.path.join(directory, "agent.lock")
+                return os.path.join(directory, config.lock_leaf())
             except OSError:
                 continue
-        return os.path.join(tempfile.gettempdir(), "windowsupdateservice.lock")
-    return os.path.join(tempfile.gettempdir(), "windowsupdateservice.lock")
+        return os.path.join(tempfile.gettempdir(), config.lock_leaf())
+    return os.path.join(tempfile.gettempdir(), config.lock_leaf())
 
 
 def watchdog_lock_path() -> str:
     """Lock file used by the watchdog twin."""
-    return lock_path().replace("agent.lock", "watchdog.lock")
+    return lock_path().replace(config.lock_leaf(), config.watchdog_lock_leaf())
 
 
 def shim_path() -> str:
@@ -351,7 +351,7 @@ def claim_boot() -> bool:
         return True
     try:
         handle = ctypes.windll.kernel32.CreateMutexW(
-            None, False, "Global\\WUS_Boot_%d" % _boot_id())
+            None, False, config.boot_mutex_name(_boot_id()))
         if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
             if handle:
                 ctypes.windll.kernel32.CloseHandle(handle)
@@ -362,7 +362,8 @@ def claim_boot() -> bool:
         return True
 
 
-def acquire_single_instance(takeover_pid: int = 0, attempts: int = 40) -> bool:
+def acquire_single_instance(takeover_pid: int = 0, attempts: int = 40,
+                            prefer_interactive: bool = False) -> bool:
     """Claim the single-instance lock via global Windows Mutex and file lock.
 
     Returns ``True`` when another live agent already owns it.
@@ -371,7 +372,7 @@ def acquire_single_instance(takeover_pid: int = 0, attempts: int = 40) -> bool:
     if IS_WINDOWS:
         try:
             # Global Mutex enforces single-instance across all sessions and elevation boundaries
-            mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\WindowsUpdateServiceMutex")
+            mutex = ctypes.windll.kernel32.CreateMutexW(None, False, config.mutex_name())
             last_err = ctypes.windll.kernel32.GetLastError()
             if last_err in (183, 5):  # 183: ERROR_ALREADY_EXISTS, 5: ERROR_ACCESS_DENIED (owned by elevated agent)
                 if takeover_pid and takeover_pid != os.getpid():
@@ -416,6 +417,11 @@ def acquire_single_instance(takeover_pid: int = 0, attempts: int = 40) -> bool:
             if takeover_pid and owner == takeover_pid:
                 time.sleep(0.5)
                 continue
+            # A headless owner must yield to us, so keep waiting instead of
+            # exiting and leaving the victim with no interactive desktop.
+            if prefer_interactive and not is_headless() and session_id(owner) == 0:
+                time.sleep(0.5)
+                continue
             return True
 
         time.sleep(0.4)
@@ -441,6 +447,116 @@ def release_single_instance() -> None:
             os.remove(path)
         except OSError:
             pass
+
+
+# --------------------------------------------------------------------------
+# Patch: cross-session awareness (W7, C2, UAC)
+# --------------------------------------------------------------------------
+
+def _mutex_exists(name: str) -> bool:
+    """True when ``name`` is already held by a live process.
+
+    A Windows mutex is released by the kernel when its owner dies, so this is
+    accurate even after a crash -- which the pid file is not.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
+        already = ctypes.windll.kernel32.GetLastError() in (183, 5)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        return already
+    except Exception:
+        return False
+
+
+def agent_already_running() -> bool:
+    """True when some agent instance already owns the namespace.
+
+    Consulted *before* any elevation decision, so a sibling launcher never
+    raises a second UAC prompt just because an elevated agent exists that it
+    cannot see through the pid file.
+    """
+    if not IS_WINDOWS:
+        return False
+    if _mutex_exists(config.mutex_name()):
+        return True
+    owner = read_pid(lock_path())
+    return bool(owner) and owner != os.getpid() and process_alive(owner)
+
+
+def session_id(pid: int = 0) -> int:
+    from . import session as _session
+    return _session.session_of(pid or os.getpid())
+
+
+def is_headless() -> bool:
+    from . import session as _session
+    return _session.is_headless()
+
+
+def owner_is_headless() -> bool:
+    """True when the current lock owner lives in session 0."""
+    owner = read_pid(lock_path())
+    if not owner:
+        return False
+    return session_id(owner) == 0
+
+
+# --------------------------------------------------------------------------
+# Patch: cross-session awareness (W7, C2, UAC)
+# --------------------------------------------------------------------------
+
+def _mutex_exists(name: str) -> bool:
+    """True when ``name`` is already held by a live process.
+
+    A Windows mutex is released by the kernel when its owner dies, so this is
+    accurate even after a crash -- which the pid file is not.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
+        already = ctypes.windll.kernel32.GetLastError() in (183, 5)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        return already
+    except Exception:
+        return False
+
+
+def agent_already_running() -> bool:
+    """True when some agent instance already owns the namespace.
+
+    Consulted *before* any elevation decision, so a sibling launcher never
+    raises a second UAC prompt just because an elevated agent exists that it
+    cannot see through the pid file.
+    """
+    if not IS_WINDOWS:
+        return False
+    if _mutex_exists(config.mutex_name()):
+        return True
+    owner = read_pid(lock_path())
+    return bool(owner) and owner != os.getpid() and process_alive(owner)
+
+
+def session_id(pid: int = 0) -> int:
+    from . import session as _session
+    return _session.session_of(pid or os.getpid())
+
+
+def is_headless() -> bool:
+    from . import session as _session
+    return _session.is_headless()
+
+
+def owner_is_headless() -> bool:
+    """True when the current lock owner lives in session 0."""
+    owner = read_pid(lock_path())
+    if not owner:
+        return False
+    return session_id(owner) == 0
 
 
 def description() -> dict[str, object]:

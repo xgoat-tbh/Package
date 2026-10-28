@@ -34,6 +34,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="interface to bind (0.0.0.0 when hosted, else loopback)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT") or config.DASHBOARD_PORT))
     parser.add_argument("--password", default="", help="dashboard password")
+    parser.add_argument("--genkey", action="store_true",
+                        help="print a fresh Ed25519 signing keypair and exit")
+    parser.add_argument("--genkey", action="store_true",
+                        help="print a fresh Ed25519 signing keypair and exit")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--stopall", "--stop", action="store_true",
                         help="stop all running controller processes and free port")
@@ -168,7 +172,13 @@ def main(argv: list[str] | None = None) -> int:
     print("  SysPy controller " + __version__)
     print("  " + "-" * 46)
     print(f"  dashboard : {url}")
-    print(f"  password  : {api.state['password']}")
+    generated = not (os.environ.get("SYSPY_PASSWORD") or args.password)
+    print(f"  password  : {api.state['password']}"
+          + ("   (generated - set SYSPY_PASSWORD to pin it)" if generated else ""))
+    if config.PUBKEY_HEX:
+        print(f"  signing   : ed25519 {config.PUBKEY_HEX[:16]}...")
+    else:
+        print("  signing   : OFF (set SYSPY_SIGN_KEY/SYSPY_PUBKEY)")
     print(f"  room      : {config.ROOM}")
     print("  " + "-" * 46)
     print("  waiting for agents...  (ctrl+c to stop)")

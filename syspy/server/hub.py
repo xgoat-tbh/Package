@@ -18,6 +18,40 @@ from typing import Any
 from urllib.parse import quote
 
 from .. import config, crypto, log, protocol
+
+
+def _sign(payload: bytes) -> str:
+    """Detached signature for an update archive.
+
+    Ed25519 when SYSPY_SIGN_KEY is set, otherwise an HMAC the agent can verify
+    with material it already has. Empty when neither is configured.
+    """
+    if config.SIGN_KEY_HEX:
+        try:
+            from .. import ed25519
+            return ed25519.sign(payload, bytes.fromhex(config.SIGN_KEY_HEX)).hex()
+        except Exception:
+            pass
+    if config.ROOM and config.PASSPHRASE:
+        return crypto.hmac_hex(crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), payload)
+    return ""
+
+
+def _sign(payload: bytes) -> str:
+    """Detached signature for an update archive.
+
+    Ed25519 when SYSPY_SIGN_KEY is set, otherwise an HMAC the agent can verify
+    with material it already has. Empty when neither is configured.
+    """
+    if config.SIGN_KEY_HEX:
+        try:
+            from .. import ed25519
+            return ed25519.sign(payload, bytes.fromhex(config.SIGN_KEY_HEX)).hex()
+        except Exception:
+            pass
+    if config.ROOM and config.PASSPHRASE:
+        return crypto.hmac_hex(crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), payload)
+    return ""
 from ..mqtt import MqttClient, random_client_id
 
 
@@ -47,6 +81,16 @@ class AgentSession:
         self.link_ok = False
         self.online = True
 
+        self.fmt = 1          # envelope format the agent last declared
+        self.proto = 1
+        self.build = ""
+        self.session = -1
+        self.folder = ""
+        self.fmt = 1          # envelope format the agent last declared
+        self.proto = 1
+        self.build = ""
+        self.session = -1
+        self.folder = ""
         self.parent = ""
         self.hop = 0
         self.parent_ip = ""
@@ -71,6 +115,10 @@ class AgentSession:
             "nick": self.nick,
             "display": self.display,
             "version": self.version,
+            "build": self.build,
+            "proto": self.proto,
+            "fmt": self.fmt,
+            "session": self.session,
             "sha": self.sha,
             "path": self.path,
             "pid": self.pid,
@@ -104,6 +152,8 @@ class Hub:
         self.received_root = os.path.abspath(received_root)
         self.db_path = db_path or os.path.join(self.received_root, "..", "agents_db.json")
         self._subscribers: list[queue.Queue[str]] = []
+        self._folders: dict[str, str] = {}
+        self._folders: dict[str, str] = {}
         self._lock = threading.Lock()
         self._client: MqttClient | None = None
         self.relay_up = False
@@ -111,20 +161,29 @@ class Hub:
         self._dirty = False
         self._outbox: list[tuple[str, dict[str, Any]]] = []
         self._roster_sent: dict[str, float] = {}
+        self.seq = 0
+        self._fallback_warned: set[str] = set()
         self.counters = collections.Counter(
-            {"decrypt_fail": 0, "master_key_fallback": 0, "publish_timeout": 0, "publish_error": 0,
-             "outbox_overflow": 0, "ws_drop": 0})
+            {"decrypt_fail": 0, "master_key_fallback": 0, "publish_timeout": 0,
+             "publish_error": 0, "outbox_overflow": 0, "ws_drop": 0,
+             "replay_dropped": 0, "id_mismatch": 0, "proto_mismatch": 0})
 
         self._load_db()
         threading.Thread(target=self._flush_db_loop, name="hub-db-flush", daemon=True).start()
 
-    def codec_for(self, identifier: str) -> protocol.Codec:
-        """Return a per-agent Codec derived via crypto.subkey, cached in self.codecs."""
+    def codec_for(self, identifier: str, fmt: int = 2) -> protocol.Codec:
+        """Per-agent, per-format Codec derived via crypto.subkey, cached.
+
+        The key is the same either way; only the envelope differs. That is what
+        lets a patched controller talk v2 to a patched agent and v1 to an old
+        one with no flag day.
+        """
         ident = identifier[6:] if identifier.startswith("agent:") else identifier
-        if ident not in self.codecs:
+        key = (ident, fmt)
+        if key not in self.codecs:
             sub = crypto.subkey(self.key, ident)
-            self.codecs[ident] = protocol.Codec(sub)
-        return self.codecs[ident]
+            self.codecs[key] = protocol.Codec(sub, fmt=fmt)
+        return self.codecs[key]
 
     def _flush_db_loop(self) -> None:
         while self._running:
@@ -184,9 +243,21 @@ class Hub:
     # ------------------------------------------------------------------
 
     def agent_folder(self, agent_id: str) -> str:
-        """Folder where this agent's received files live."""
-        agent = self.agents.get(agent_id)
-        folder = os.path.join(self.received_root, safe_name(agent.name if agent else agent_id))
+        """Folder where this agent's received files live.
+
+        Cached on first use so the URL is stable: it used to be derived from the
+        display name while the session existed and from the raw id after the
+        agent was deleted, so every previously received file 404'd.
+        """
+        with self._lock:
+            cached = self._folders.get(agent_id)
+            if cached:
+                os.makedirs(cached, exist_ok=True)
+                return cached
+            agent = self.agents.get(agent_id)
+            leaf = safe_name(agent.name) if agent else safe_name(agent_id)
+            folder = os.path.join(self.received_root, leaf)
+            self._folders[agent_id] = folder
         os.makedirs(folder, exist_ok=True)
         return folder
 
@@ -207,15 +278,23 @@ class Hub:
                 self._subscribers.remove(channel)
 
     def publish(self, event: dict[str, Any]) -> None:
-        """Fan an event out to every dashboard listener."""
-        payload = json.dumps(event, default=str)
+        """Fan an event out to every dashboard listener, with a sequence number."""
         with self._lock:
+            self.seq += 1
+            event = {**event, "seq": self.seq}
             targets = list(self._subscribers)
+        payload = json.dumps(event, default=str)
         for channel in targets:
             try:
                 channel.put_nowait(payload)
             except queue.Full:
-                pass
+                # Was a silent desync: the counter existed and was never bumped.
+                self.counters["ws_drop"] += 1
+                try:
+                    channel.get_nowait()
+                    channel.put_nowait(payload)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Registry
@@ -322,7 +401,7 @@ class Hub:
             self._enqueue(agent_id, message)
             return "queued"
         try:
-            codec = self.codec_for(agent.remote_id)
+            codec = self.codec_for(agent.remote_id, agent.fmt or 1)
             payload = codec.encode(message)
             if self._client.publish_wait(config.topic_down(agent.remote_id), payload,
                                          qos=1, timeout=6.0):
@@ -342,6 +421,12 @@ class Hub:
         if len(self._outbox) > 5000:
             self._outbox = self._outbox[-5000:]
             self.counters["outbox_overflow"] += 1
+
+    def counters_snapshot(self) -> dict:
+        return dict(self.counters) | {"seq": self.seq, "live_transfers": self.reassembler.live()}
+
+    def counters_snapshot(self) -> dict:
+        return dict(self.counters) | {"seq": self.seq, "live_transfers": self.reassembler.live()}
 
     def flush_outbox(self) -> int:
         if not self._client or not self._client.alive or not self._outbox:
@@ -375,7 +460,10 @@ class Hub:
                                        "dest": destination, **part}
             if kind == "update":
                 message["sha"] = digest
-                message["proto"] = 1
+                message["proto"] = config.PROTOCOL_VERSION
+                signature = _sign(payload)
+                if signature:
+                    message["sig"] = signature
             status = self.send(agent_id, message)
             if status == "sent":
                 sent_count += 1
@@ -390,16 +478,38 @@ class Hub:
     # ------------------------------------------------------------------
 
     def _on_message(self, topic: str, payload: bytes) -> None:
+        # The topic segment is authoritative. The payload id is advisory.
         remote_id = topic.rsplit("/", 1)[-1]
         agent_id = "agent:" + remote_id
 
-        # Try per-agent subkey first, then fall back to master key for backward compatibility
-        try:
-            message = self.codec_for(remote_id).decode(payload)
-        except Exception:
+        known = self.agents.get(agent_id)
+        fmts = [known.fmt if known else 2]
+        if 1 not in fmts:
+            fmts.append(1)
+
+        message = None
+        for fmt in fmts:
+            message, reason = self.codec_for(remote_id, fmt).decode_message(payload)
+            if reason == protocol.REASON_REPLAY:
+                self.counters["replay_dropped"] += 1
+                return
+            if reason == protocol.REASON_OK:
+                break
+        if message is None:
+            # Master-key fallback only while an agent has not declared a format.
+            # An agent that HAS declared one and still fails is a real problem,
+            # not something to paper over silently.
+            if known is not None and known.fmt == 2:
+                self.counters["decrypt_fail"] += 1
+                return
             try:
                 message = self.codec.decode(payload)
                 self.counters["master_key_fallback"] += 1
+                if remote_id not in self._fallback_warned:
+                    self._fallback_warned.add(remote_id)
+                    log.get("hub").warning(
+                        "agent %s decoded with the master key (fmt not declared)",
+                        remote_id)
             except Exception:
                 self.counters["decrypt_fail"] += 1
                 return
@@ -451,7 +561,28 @@ class Hub:
                 is_new = False
 
         agent.touch()
-        agent.remote_id = message.get("id", remote_id)
+        # Topic wins. The payload id is advisory and a mismatch used to silently
+        # re-point both the codec and the downlink topic at the claimed id.
+        claimed = str(message.get("id") or "")
+        if claimed and claimed != remote_id:
+            self.counters["id_mismatch"] += 1
+            if agent_id not in self._fallback_warned:
+                self._fallback_warned.add(agent_id)
+                log.get("hub").warning(
+                    "agent on topic %s claims id %s (topic wins)", remote_id, claimed)
+        agent.remote_id = remote_id
+        try:
+            agent.fmt = int(message.get("fmt") or agent.fmt or 1)
+        except (TypeError, ValueError):
+            pass
+        agent.proto = int(message.get("proto") or agent.proto or 1)
+        if agent.proto > config.PROTOCOL_VERSION:
+            self.counters["proto_mismatch"] += 1
+        agent.build = str(message.get("build") or agent.build)
+        try:
+            agent.session = int(message.get("session", agent.session))
+        except (TypeError, ValueError):
+            pass
         agent.version = message.get("ver", agent.version)
         agent.sha = message.get("sha", agent.sha)
         agent.path = message.get("path", agent.path)
@@ -522,7 +653,9 @@ class Hub:
                         will_topic=config.topic_up("controller"),
                         will_payload=self.codec.encode({"t": "bye"}),
                     )
-                    client.subscribe(config.ROOM + "/up/+", qos=1)
+                    if not client.subscribe(config.ROOM + "/up/+", qos=1):
+                        log.get("hub").warning(
+                            "broker did not SUBACK %s/up/+ (ACL?)", config.ROOM)
                     self._client = client
                     self.relay_up = True
                     self.publish({"type": "relay", "up": True, "broker": f"{host}:{port}"})

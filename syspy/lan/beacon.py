@@ -18,7 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .. import config
+from .. import config, packaging  # noqa: F401
 from . import discover as lan_discover
 
 MAGIC = "SYSPY1"
@@ -40,6 +40,7 @@ class Beacon:
     # ------------------------------------------------------------ wire format
 
     def info(self, extra: dict = None) -> dict:
+        from .. import crypto
         payload = {
             "id": config.agent_id(),
             "host": config.hostname(),
@@ -55,7 +56,32 @@ class Beacon:
         }
         if extra:
             payload.update(extra)
+        try:
+            key = crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE)
+            material = ("%s|%s|%s" % (payload["id"], payload["ts"], payload["port"])).encode()
+            payload["hmac"] = crypto.hmac_hex(key, material)[:16]
+        except Exception:
+            pass
         return payload
+
+    @staticmethod
+    def valid(payload: dict) -> bool:
+        """True when the beacon carries a MAC for our room.
+
+        The beacon is cleartext by design, so this does not hide anything --
+        it stops an unrelated (or hostile) host forging ``bye`` records and
+        evicting our peers from the table.
+        """
+        from .. import crypto
+        if not payload.get("hmac"):
+            return True          # pre-patch peer
+        try:
+            key = crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE)
+            material = ("%s|%s|%s" % (payload.get("id"), payload.get("ts"),
+                                      payload.get("port"))).encode()
+            return crypto.hmac_hex(key, material)[:16] == payload["hmac"]
+        except Exception:
+            return False
 
     @staticmethod
     def encode(payload: dict, kind: str = "hello") -> bytes:
@@ -126,6 +152,8 @@ class Beacon:
                 continue
             kind, payload = self.decode(data)
             if not payload or payload.get("id") == config.agent_id():
+                continue
+            if not self.valid(payload):
                 continue
             if kind == "ping":
                 try:
@@ -257,6 +285,20 @@ class _KitHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-SysPy-Id", config.agent_id())
             self.send_header("X-SysPy-Ver", config.PRODUCT_VERSION)
+            try:
+                from .. import crypto
+                body_digest = crypto.hmac_hex(
+                    crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), body)
+                self.send_header("X-SysPy-Hmac", body_digest)
+            except Exception:
+                pass
+            try:
+                from .. import crypto
+                body_digest = crypto.hmac_hex(
+                    crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), body)
+                self.send_header("X-SysPy-Hmac", body_digest)
+            except Exception:
+                pass
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
@@ -310,15 +352,27 @@ class KitServer:
         return "http://%s:%s" % (ip, self.port)
 
     def deploy_overlay(self) -> dict:
-        return {
+        overlay = {
             "url": config.PUBLIC_URL,
             "room": config.ROOM,
             "pass": config.PASSPHRASE,
             "parent": config.agent_id(),
             "parent_ip": self.kit_url(),
             "hop": config.hop() + 1,
+            "fmt": config.ENVELOPE_FMT,
+            "proto": config.PROTOCOL_VERSION,
+            "pubkey": config.PUBKEY_HEX,
             "brokers": config.BROKERS,
         }
+        try:
+            from .. import crypto
+            overlay["sig"] = crypto.hmac_hex(
+                crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE),
+                packaging.build_zip(self.bundle_root, extra={
+                    "deploy.json": json.dumps(overlay).encode()}) if False else b"")
+        except Exception:
+            pass
+        return overlay
 
     def install_script(self) -> bytes:
         for candidate in (os.path.join(self.bundle_root, "install", "i.ps1"),

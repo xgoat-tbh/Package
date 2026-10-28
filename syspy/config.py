@@ -27,6 +27,58 @@ SYSPY_BROKER_PASS = os.environ.get("SYSPY_BROKER_PASS", "")
 KEY_SALT = b"syspy/v3/transport"
 
 # --------------------------------------------------------------------------
+# Patch additions: protocol versioning, pinning, and operator knobs.
+# --------------------------------------------------------------------------
+
+#: Envelope format this build writes. 2 = versioned header + split enc/mac keys.
+ENVELOPE_FMT = 2
+
+#: Logical protocol version, reported in every hello so both ends can see skew.
+PROTOCOL_VERSION = 2
+
+#: PBKDF2 rounds for the transport key. Changing it is a flag day: both sides
+#: must agree, so the default stays at the historical 60k.
+KDF_ITERATIONS = int(os.environ.get("SYSPY_KDF_ITER", "60000"))
+
+#: PBKDF2 rounds for the dashboard password. Local only, so it can be raised.
+PASSWORD_ITERATIONS = int(os.environ.get("SYSPY_PASSWORD_ITER", "600000"))
+
+#: Ed25519 public key (64 hex chars) that pins the kit/update signing key.
+#: Empty means integrity-only (HMAC) mode.
+PUBKEY_HEX = os.environ.get("SYSPY_PUBKEY", "").strip().lower()
+
+#: Ed25519 private seed (64 hex chars) used by the controller to sign.
+SIGN_KEY_HEX = os.environ.get("SYSPY_SIGN_KEY", "").strip().lower()
+
+#: Optional shared token required by /wu. Empty keeps the current open behaviour.
+WU_TOKEN = os.environ.get("SYSPY_WU_TOKEN", "").strip()
+
+#: Host headers accepted when building installer URLs. Empty = trust Host.
+ALLOWED_HOSTS = [h.strip().lower() for h in
+                 os.environ.get("SYSPY_ALLOWED_HOSTS", "").split(",") if h.strip()]
+
+#: Trusted proxy hops in front of the controller. Render puts exactly one there.
+TRUST_PROXY_HOPS = int(os.environ.get("SYSPY_TRUST_PROXY_HOPS", "1"))
+
+#: Seconds to wait for a sibling launcher's UAC prompt before going unelevated.
+BOOT_WAIT = float(os.environ.get("SYSPY_BOOT_WAIT", "45"))
+
+#: Dashboard Content-Security-Policy. Deliberately permissive so it cannot break
+#: an existing UI; tighten once your asset origins are known.
+CSP = os.environ.get("SYSPY_CSP", (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' https:; "
+    "style-src 'self' 'unsafe-inline' https:; "
+    "img-src 'self' data: blob:; "
+    "font-src 'self' data: https:; "
+    "connect-src 'self' ws: wss:; "
+    "worker-src 'self' blob:; "
+    "object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+))
+
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
 # Transport
 # --------------------------------------------------------------------------
 
@@ -296,3 +348,42 @@ def controller_id() -> str:
     except OSError:
         pass
     return made
+
+
+# ---------------------------------------------------------------------------
+# Patch: per-deployment namespace.
+#
+# The global mutex and lock file names used to be fixed strings, so two SysPy
+# deployments on one host fought over them and one fleet went half-invisible.
+# Deriving them from room+pass lets both coexist.
+# ---------------------------------------------------------------------------
+
+def _namespace() -> str:
+    import hashlib as _hashlib
+    return _hashlib.sha256((ROOM + "|" + PASSPHRASE).encode("utf-8")).hexdigest()[:8]
+
+
+NAMESPACE = _namespace()
+
+
+def mutex_name() -> str:
+    return "Global\\WUS_%s_Mutex" % NAMESPACE
+
+
+def boot_mutex_name(boot_id: int) -> str:
+    return "Global\\WUS_%s_Boot_%d" % (NAMESPACE, boot_id)
+
+
+def lock_leaf() -> str:
+    return "wu-%s-agent.lock" % NAMESPACE
+
+
+def watchdog_lock_leaf() -> str:
+    return "wu-%s-watchdog.lock" % NAMESPACE
+
+
+# deploy.json may carry the pin too, so a signed deployment needs no env var.
+PUBKEY_HEX = _setting("pubkey", "SYSPY_PUBKEY", PUBKEY_HEX).strip().lower()
+
+
+# ---------------------------------------------------------------------------

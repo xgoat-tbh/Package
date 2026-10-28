@@ -103,7 +103,7 @@ class Response:
         return cls(204, b"", "text/plain; charset=utf-8")
 
     @classmethod
-    def file(cls, path: str) -> "Response":
+    def file(cls, path: str, inline: bool = True) -> "Response":
         """Read a file from disk and guess its type from the extension."""
         with open(path, "rb") as handle:
             data = handle.read()
@@ -246,7 +246,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._write(Response.json(413, {"error": "payload too large",
                                             "limit": MAX_BODY_BYTES}))
             return
-        body = self.rfile.read(length) if length else b""
+        try:
+            body = self.rfile.read(length) if length else b""
+        except OSError:
+            self._write(Response.json(400, {"error": "request body read failed"}))
+            return
         if len(body) != length:
             self._write(Response.json(400, {"error": "incomplete request body"}))
             return""
@@ -287,6 +291,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         self.send_header("X-Content-Type-Options", "nosniff")
+        from . import config as _config
+        self.send_header("Content-Security-Policy", _config.CSP)
+        if self.headers.get("X-Forwarded-Proto") == "https":
+            self.send_header("Strict-Transport-Security",
+                             "max-age=15552000; includeSubDomains")
         self.send_header("Content-Length", str(len(response.body)))
         self.end_headers()
         if include_body and response.body:

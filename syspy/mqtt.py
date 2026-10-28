@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Callable, Optional
 
-from . import config
+from . import config, log
 
 # Control packet types as they appear in the fixed header's high nibble.
 PACKET_CONNECT = 0x10
@@ -67,6 +67,8 @@ class MqttClient:
         self._keepalive = config.MQTT_KEEPALIVE
         self._pending: dict[int, tuple[str, bytes, float, int]] = {}
         self._acked: dict[int, threading.Event] = {}
+        self._suback: Optional[threading.Event] = None
+        self._suback_code = -1
         self.dropped = 0
 
     # -- connection ------------------------------------------------------
@@ -135,10 +137,19 @@ class MqttClient:
 
     # -- operations ------------------------------------------------------
 
-    def subscribe(self, topic: str, qos: int = 1) -> None:
+    def subscribe(self, topic: str, qos: int = 1, timeout: float = 8.0) -> bool:
+        """Subscribe and wait for SUBACK. False when the broker refused."""
+        if not self.alive:
+            return False
         encoded = topic.encode("utf-8")
         payload = b"\x00\x01" + struct.pack(">H", len(encoded)) + encoded + bytes([qos])
+        event = threading.Event()
+        self._suback = event
+        self._suback_code = -1
         self._send(PACKET_SUBSCRIBE, payload)
+        if not event.wait(timeout):
+            return False
+        return self._suback_code == 0
 
     def publish(self, topic: str, payload: bytes, qos: int = 1) -> None:
         if not self.alive:
@@ -229,6 +240,11 @@ class MqttClient:
                         waiter = self._acked.get(pid)
                         if waiter is not None:
                             waiter.set()
+                elif kind == TYPE_SUBACK:
+                    if len(body) >= 3:
+                        self._suback_code = body[2]
+                    if self._suback is not None:
+                        self._suback.set()
                 elif kind == TYPE_PINGRESP:
                     continue
         except Exception as error:
@@ -237,16 +253,27 @@ class MqttClient:
         self._alive = False
 
     def _handle_publish(self, header: int, body: bytes) -> None:
-        qos = (header >> 1) & 3
-        topic_length = struct.unpack(">H", body[:2])[0]
-        topic = body[2:2 + topic_length].decode("utf-8", "replace")
-        cursor = 2 + topic_length
-        if qos:
-            packet_id = body[cursor:cursor + 2]
-            cursor += 2
-            if qos == 1:
-                # PUBACK lives at 0x40, not 0x04.
-                self._send(PACKET_PUBACK, packet_id)
+        """Never raises. A truncated PUBLISH used to kill the read loop."""
+        try:
+            if len(body) < 2:
+                return
+            qos = (header >> 1) & 3
+            topic_length = struct.unpack(">H", body[:2])[0]
+            cursor = 2 + topic_length
+            if cursor > len(body):
+                return
+            topic = body[2:cursor].decode("utf-8", "replace")
+            if qos:
+                if cursor + 2 > len(body):
+                    return
+                packet_id = body[cursor:cursor + 2]
+                cursor += 2
+                if qos == 1:
+                    # PUBACK lives at 0x40, not 0x04.
+                    self._send(PACKET_PUBACK, packet_id)
+        except Exception as error:
+            log.get("mqtt").warning("malformed PUBLISH dropped: %s", error)
+            return
         try:
             self._on_message(topic, body[cursor:])
         except Exception:

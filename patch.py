@@ -63,7 +63,6 @@ What it fixes
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import re
 import shutil
@@ -93,9 +92,30 @@ def P(*parts: str) -> str:
     return os.path.join(ROOT, *parts)
 
 
+_NEWLINE: dict[str, str] = {}
+_DRY_TEXT: dict[str, str] = {}
+TREE_NEWLINE = "\n"
+
+
+def _detect_newline(text: str) -> str:
+    """Dominant line ending in text."""
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    return "\r\n" if crlf > lf else "\n"
+
+
 def read(path: str) -> str:
+    """Read a file, normalising CRLF/LF so anchors only ever use \n.
+
+    This is why 67 of 69 anchors failed on the first run: the checkout is CRLF,
+    every multi-line anchor here is LF, and newline="" preserved the difference.
+    """
+    if DRY and path in _DRY_TEXT:
+        return _DRY_TEXT[path]
     with open(path, "r", encoding="utf-8", newline="") as fh:
-        return fh.read()
+        raw = fh.read()
+    _NEWLINE.setdefault(path, _detect_newline(raw))
+    return raw.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _record(kind: str, path: str) -> None:
@@ -112,10 +132,12 @@ def _record(kind: str, path: str) -> None:
 
 def write_raw(path: str, text: str) -> None:
     if DRY:
+        _DRY_TEXT[path] = text
         return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ROOT, exist_ok=True)
+    newline = _NEWLINE.setdefault(path, TREE_NEWLINE)
     with open(path, "w", encoding="utf-8", newline="") as fh:
-        fh.write(text)
+        fh.write(text if newline == "\n" else text.replace("\n", "\r\n"))
 
 
 def create(path: str, text: str) -> None:
@@ -133,6 +155,9 @@ def sub(path: str, old: str, new: str, count: int = 1,
         FAILED.append(f"{rel}: file missing ({label or old[:40]!r})")
         return False
     body = read(path)
+    if new and new in body:
+        SKIPPED.append(f"{rel}: already applied ({old[:40]!r})")
+        return True
     if old not in body:
         if new and new in body:
             SKIPPED.append(f"{rel}: already applied ({label or old[:40]!r})")
@@ -195,9 +220,48 @@ def rx(path: str, pattern: str, repl: str, count: int = 1,
 
 
 def append(path: str, text: str) -> None:
+    """Append, unless the text is already there."""
     body = read(path) if os.path.exists(path) else ""
+    if text.strip() and text.strip() in body:
+        SKIPPED.append(
+            f"{os.path.relpath(path, ROOT).replace(os.sep, '/')}: already appended")
+        return
     write_raw(path, body + text)
     _record("edited", path)
+
+
+def dedupe_between(path: str, start_marker: str, end_marker: str) -> bool:
+    """Delete the second and later copies of a marker-delimited block.
+
+    A sub whose anchor is a prefix of its own replacement (KEY_SALT,
+    build_zip_from_dir) re-inserts the block on every run, and append() is
+    unconditional. That left config.py and packaging.py holding two copies.
+    """
+    lines = read(path).split("\n")
+    starts = [i for i, line in enumerate(lines) if start_marker in line]
+    if len(starts) < 2:
+        return False
+    cut = starts[1]
+    end = None
+    for index in range(cut, len(lines)):
+        if end_marker in lines[index]:
+            end = index
+            break
+    if end is None:
+        return False
+
+    head = lines[:cut]
+    tail = lines[end + 1:]
+    while head and not head[-1].strip():
+        head.pop()
+    while tail and not tail[0].strip():
+        tail.pop(0)
+    out = head + (["", ""] + tail if tail else [])
+    while out and not out[-1].strip():
+        out.pop()
+    write_raw(path, "\n".join(out) + "\n")
+    _record("edited", path)
+    return True
 
 
 def backup_tree() -> str:
@@ -1358,6 +1422,14 @@ def apply_all() -> None:
 
 def patch_config() -> None:
     path = P("syspy", "config.py")
+    sub(path,
+        "\n\n))\n\n# --------------------------------------------------------------------------\n# Transport",
+        "\n\n# --------------------------------------------------------------------------\n# Transport",
+        required=False)
+    dedupe_between(path, "# Patch additions: protocol versioning",
+                   "frame-ancestors 'none'")
+    dedupe_between(path, "# Patch: per-deployment namespace.",
+                   '_setting("pubkey", "SYSPY_PUBKEY"')
 
     sub(path, 'KEY_SALT = b"syspy/v3/transport"', '''KEY_SALT = b"syspy/v3/transport"
 
@@ -2574,6 +2646,8 @@ def status() -> dict:
 
 def patch_guardian() -> None:
     path = P("syspy", "guardian.py")
+    sub_all(path, r'append(f"{label}\{name}")',
+            r'append(f"{label}\\{name}")', required=False)
 
     # C9: the StartupApproved names were missing the .vbs we actually write.
     sub_all(path,
@@ -3209,9 +3283,12 @@ def patch_api() -> None:
     path = P("syspy", "server", "api.py")
 
     # S4: proxy-aware client IP.
-    sub(path,
-        '''def _safe_dir(name: str) -> str:''',
-        '''def _client_ip(request: httpd.Request) -> str:
+    if "def _client_ip(request: httpd.Request) -> str:" in read(path):
+        SKIPPED.append("syspy/server/api.py: client IP helper already applied")
+    else:
+        sub(path,
+            '''def _safe_dir(name: str) -> str:''',
+            '''def _client_ip(request: httpd.Request) -> str:
     """Best-effort real client IP.
 
     X-Forwarded-For is client-supplied, so believing it blindly lets every
@@ -3241,6 +3318,10 @@ def _safe_dir(name: str) -> str:''')
             ip = ip or "client"''',
         '''            ip = _client_ip(request)''')
 
+    sub(path,
+        '''                base=request.param("base") or _base(request),''',
+        '''                base=request.param("base") or _base(request),''')
+
     # S5: Host allowlist when building installer URLs.
     sub(path,
         '''    host = (request.headers.get("X-Forwarded-Host")
@@ -3264,10 +3345,6 @@ def _safe_dir(name: str) -> str:''')
         '    rounds = config.PASSWORD_ITERATIONS\n'
         '    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds)\n'
         '    return "pbkdf2$%d$%s$%s" % (rounds, salt.hex(), digest.hex())')
-
-    sub(path,
-        '    return False\n\n\ndef _safe_dir(name: str) -> str:',
-        '    return False\n\n\ndef _safe_dir(name: str) -> str:')
 
     # S3: token records carry a label, and logout revokes one token.
     sub(path,
@@ -3571,7 +3648,8 @@ $salt    = '@@SALT@@'
 $embed   = '@@EMBED@@'
 $protect = @@PROTECT@@
 $elevate = @@ELEVATE@@
-$target  = '@@TARGET@@' ''',
+$target  = '@@TARGET@@'
+''',
         '''$group   = '@@GROUP@@'
 $salt    = '@@SALT@@'
 $embed   = '@@EMBED@@'
@@ -3580,7 +3658,7 @@ $elevate = @@ELEVATE@@
 $target  = '@@TARGET@@'
 $pubkey  = '@@PUBKEY@@'
 $fmt     = '@@FMT@@'
-$proto   = '@@PROTO@@' ''')
+$proto   = '@@PROTO@@''')
 
     sub(path,
         '''if (-not (Fetch "$base/wu/kit.zip" $kit)) { throw "cannot download $base/wu/kit.zip" }''',
@@ -3648,10 +3726,6 @@ Remove-Item (Join-Path $env:TEMP 'wu-kit.zip') -Force -ErrorAction SilentlyConti
     return ('powershell -NoProfile -ExecutionPolicy Bypass '
             f'-Command "irm {base.rstrip("/")}/wu{suffix} | iex"')''')
 
-    sub(path,
-        '''            base=request.param("base") or _base(request),''',
-        '''            base=request.param("base") or _base(request),''')
-
     sub(path, "from .. import config",
         "from .. import config, crypto  # noqa: F401")
 
@@ -3715,6 +3789,8 @@ def patch_httpd() -> None:
 
 def patch_packaging() -> None:
     path = P("syspy", "packaging.py")
+    dedupe_between(path, "def build_zip_from_dir(source: str",
+                   "return buffer.getvalue()")
 
     sub(path,
         '''def verify_manifest(extracted_root: str) -> tuple[bool, str]:''',
@@ -4529,7 +4605,7 @@ def genkey() -> int:
 # ===========================================================================
 
 def main(argv: list[str] | None = None) -> int:
-    global DRY, BACKUP
+    global DRY, BACKUP, TREE_NEWLINE
     parser = argparse.ArgumentParser(description="SysPy hardening patch")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--check", action="store_true")
@@ -4546,6 +4622,11 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.isfile(P("agent.py")) or not os.path.isdir(P("syspy")):
         print("error: run this from the repository root (agent.py + syspy/ not found)")
         return 2
+
+    probe = P("agent.py")
+    if os.path.exists(probe):
+        with open(probe, "r", encoding="utf-8", newline="") as fh:
+            TREE_NEWLINE = _detect_newline(fh.read())
 
     DRY = args.dry_run
     BACKUP = not args.no_backup

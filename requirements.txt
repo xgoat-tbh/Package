@@ -1,6 +1,13 @@
 # SysPy deliberately depends on nothing outside the standard library.
-# Optional extras, only needed for specific features:
 #
-#   opencv-python-headless   -> webcam capture (agent side)
-#   pynput                   -> keylogger on Linux/macOS (agent side)
+# The agent side is stdlib-only ON PURPOSE: it has to run on a machine where
+# nothing is installed. Everything below is optional and only needed for one
+# specific feature, and the agent installs what it needs at first use into its
+# own private runtime.
+#
+#   opencv-python-headless   -> webcam capture (agent side, pip-installed on demand)
+#   pynput                   -> keylogger on Linux/macOS (agent side, optional)
 #   pyinstaller              -> build a standalone .exe (build machine only)
+#
+# NOTE: the controller-side crypto/Ed25519 is hand-rolled in syspy/ for the same
+# reason -- you cannot import `cryptography` on a machine that has no pip.

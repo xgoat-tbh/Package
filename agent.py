@@ -5,7 +5,9 @@
     python agent.py --hidden       # start with the console window hidden
     python agent.py --show         # keep the console visible
     python agent.py --install      # write persistence and exit
-    python agent.py --uninstall    # remove everything and exit
+    python agent.py --stop         # kill running instances, keep vectors
+    python agent.py --uninstall    # soft remove: vectors stay, agent returns
+    python agent.py --purge        # hard remove: everything, incl. anchor
     python agent.py --check        # print a health report and exit
     python agent.py --watchdog     # run as the supervisor process
 
@@ -37,7 +39,7 @@ import sys
 # writes a fresh ``syspy/`` next to the executable instead, so if that folder
 # exists we put its parent at the front of ``sys.path`` and let it win.
 #
-# This must run *before* ``from syspy.agent.core import main``.
+# This must run *before* ``from syspy.agent.core import main  # noqa: E402  # noqa: E402``.
 # ---------------------------------------------------------------------------
 
 if getattr(sys, "frozen", False):

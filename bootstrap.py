@@ -101,6 +101,95 @@ def extract(blob: bytes, target: str) -> None:
         archive.extractall(target)
 
 
+def _verify_blob(blob: bytes, quiet: bool = False, signature: str = "") -> None:
+    """Ed25519 when pinned, else HMAC. Fails closed when a key is pinned.
+
+    The manifest lives inside the archive it describes, so on its own it only
+    catches corruption. A peer serves the kit over plain HTTP with no auth, so
+    this is the difference between "a LAN neighbour can push code" and "cannot".
+    """
+    from syspy import config as _config
+    from syspy import crypto as _crypto
+
+    public = _config.PUBKEY_HEX
+    if not public and not _config.ROOM:
+        return
+    if not signature:
+        signature = _crypto.hmac_hex(
+            _crypto.kit_hmac_key(_config.ROOM, _config.PASSPHRASE), blob)
+    ok, how = _crypto.verify_signature(
+        blob, signature, public,
+        _crypto.kit_hmac_key(_config.ROOM, _config.PASSPHRASE))
+    if not ok:
+        raise ValueError(f"kit rejected: {how}")
+    _say(quiet, f"  kit verified ({how})")
+
+
+def _peer_meta_url() -> str:
+    return ""
+
+
+def _verify_blob(blob: bytes, quiet: bool = False, signature: str = "") -> None:
+    """Ed25519 when pinned, else HMAC. Fails closed when a key is pinned.
+
+    The manifest lives inside the archive it describes, so on its own it only
+    catches corruption. A peer serves the kit over plain HTTP with no auth, so
+    this is the difference between "a LAN neighbour can push code" and "cannot".
+    """
+    from syspy import config as _config
+    from syspy import crypto as _crypto
+
+    public = _config.PUBKEY_HEX
+    if not public and not _config.ROOM:
+        return
+    if not signature:
+        signature = _crypto.hmac_hex(
+            _crypto.kit_hmac_key(_config.ROOM, _config.PASSPHRASE), blob)
+    ok, how = _crypto.verify_signature(
+        blob, signature, public,
+        _crypto.kit_hmac_key(_config.ROOM, _config.PASSPHRASE))
+    if not ok:
+        raise ValueError(f"kit rejected: {how}")
+    _say(quiet, f"  kit verified ({how})")
+
+
+def _peer_meta_url() -> str:
+    return ""
+
+
+def _verify_blob(blob: bytes, quiet: bool = False) -> None:
+    """Ed25519 when pinned, else HMAC. Fails closed when a key is pinned.
+
+    The manifest lives inside the archive it describes, so on its own it only
+    catches corruption. A peer serves the kit over plain HTTP with no auth, so
+    this is the difference between "a LAN neighbour can push code" and "cannot".
+    """
+    from syspy import config as _config
+    from syspy import crypto as _crypto
+
+    public = _config.PUBKEY_HEX
+    if not public and not _config.ROOM:
+        return
+    signature = ""
+    try:
+        signature = fetch(_peer_meta_url(), timeout=30).decode("ascii").strip()
+    except Exception:
+        signature = ""
+    if not signature:
+        signature = _crypto.hmac_hex(
+            _crypto.kit_hmac_key(_config.ROOM, _config.PASSPHRASE), blob)
+    ok, how = _crypto.verify_signature(
+        blob, signature, public,
+        _crypto.kit_hmac_key(_config.ROOM, _config.PASSPHRASE))
+    if not ok:
+        raise ValueError(f"kit rejected: {how}")
+    _say(quiet, f"  kit verified ({how})")
+
+
+def _peer_meta_url() -> str:
+    return ""
+
+
 def write_deploy(target: str, data: dict) -> str:
     path = os.path.join(target, "deploy.json")
     with open(path, "w", encoding="utf-8") as handle:
@@ -254,7 +343,7 @@ def start_agent(target: str, extra: list[str] | None = None) -> bool:
     commands = find_python(target)
     if not commands:
         return False
-    command = list(commands[0]) + [entry, "--hidden"] + list(extra or [])
+    command = list(commands[0]) + [entry, "--hidden", "--no-elevate"] + list(extra or [])
 
     kwargs: dict = {"close_fds": True, "cwd": target}
     if IS_WINDOWS:
@@ -300,23 +389,28 @@ def install(args: argparse.Namespace) -> int:
             with open(candidate, "rb") as handle:
                 blob = handle.read()
         else:
-            # Loose directory: zip it on the fly.
-            buffer = io.BytesIO()
-            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-                for name in OWNED:
-                    path = os.path.join(args.kit, name)
-                    if os.path.isfile(path):
-                        archive.write(path, name)
-                    elif os.path.isdir(path):
-                        for current, _dirs, files in os.walk(path):
-                            for filename in files:
-                                full = os.path.join(current, filename)
-                                archive.write(full, os.path.relpath(full, args.kit))
-            blob = buffer.getvalue()
+            # Loose directory: zip it on the fly, *with* a manifest, or the
+            # manifest-checking extractor rejects it.
+            from syspy import packaging as _packaging
+            blob = _packaging.build_zip_from_dir(args.kit)
     elif args.from_peer:
         url = args.from_peer.rstrip("/")
         _say(args.quiet, f"  pulling kit from {url}")
         blob = fetch(url + "/kit", timeout=180)
+        try:
+            meta = fetch(url + "/deploy.json", timeout=30)
+            import json as _json
+            signature = str((_json.loads(meta.decode("utf-8")) or {}).get("sig") or "")
+        except Exception:
+            signature = ""
+        _verify_blob(blob, args.quiet, signature)
+        try:
+            meta = fetch(url + "/deploy.json", timeout=30)
+            import json as _json
+            signature = str((_json.loads(meta.decode("utf-8")) or {}).get("sig") or "")
+        except Exception:
+            signature = ""
+        _verify_blob(blob, args.quiet, signature)
 
     if not blob:
         print("error: nothing to install (use --kit or --from-peer)")
@@ -359,6 +453,9 @@ def install(args: argparse.Namespace) -> int:
         "room": config.ROOM,
         "pass": config.PASSPHRASE,
         "salt": secrets.token_hex(2),
+        "fmt": config.ENVELOPE_FMT,
+        "proto": config.PROTOCOL_VERSION,
+        "pubkey": config.PUBKEY_HEX,
         "brokers": config.BROKERS,
         "parent": args.parent,
         "parent_ip": args.parent_ip,

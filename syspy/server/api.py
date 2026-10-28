@@ -12,6 +12,10 @@ import threading
 import time
 from typing import Any
 
+import threading
+
+import threading
+
 from .. import config, crypto, httpd, log, packaging, ws
 from .hub import Hub, safe_name
 from . import webinstall, runtime_cache
@@ -24,8 +28,9 @@ SESSION_COOKIE = "syspy_session"
 def _hash_password(password: str, salt: bytes = b"") -> str:
     """PBKDF2-SHA256. Stdlib only; the salt travels with the hash."""
     salt = salt or os.urandom(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
-    return "pbkdf2$120000$%s$%s" % (salt.hex(), digest.hex())
+    rounds = config.PASSWORD_ITERATIONS
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds)
+    return "pbkdf2$%d$%s$%s" % (rounds, salt.hex(), digest.hex())
 
 
 def _same(left: str, right: str) -> bool:
@@ -49,6 +54,46 @@ def _verify_password(entered: str, stored: str) -> bool:
         return False
 
 
+def _client_ip(request: httpd.Request) -> str:
+    """Best-effort real client IP.
+
+    X-Forwarded-For is client-supplied, so believing it blindly lets every
+    request pick a fresh rate-limit bucket. Walk ``TRUST_PROXY_HOPS`` entries in
+    from the right instead, which is the only entry the last proxy added.
+    """
+    if config.TRUST_PROXY_HOPS > 0:
+        chain = [part.strip() for part in
+                 (request.headers.get("X-Forwarded-For") or "").split(",") if part.strip()]
+        if chain:
+            index = max(0, len(chain) - config.TRUST_PROXY_HOPS)
+            return chain[index]
+    for header in ("X-Real-IP", "CF-Connecting-IP"):
+        value = (request.headers.get(header) or "").strip()
+        if value:
+            return value
+    return "client"
+
+
+def _client_ip(request: httpd.Request) -> str:
+    """Best-effort real client IP.
+
+    X-Forwarded-For is client-supplied, so believing it blindly lets every
+    request pick a fresh rate-limit bucket. Walk ``TRUST_PROXY_HOPS`` entries in
+    from the right instead, which is the only entry the last proxy added.
+    """
+    if config.TRUST_PROXY_HOPS > 0:
+        chain = [part.strip() for part in
+                 (request.headers.get("X-Forwarded-For") or "").split(",") if part.strip()]
+        if chain:
+            index = max(0, len(chain) - config.TRUST_PROXY_HOPS)
+            return chain[index]
+    for header in ("X-Real-IP", "CF-Connecting-IP"):
+        value = (request.headers.get(header) or "").strip()
+        if value:
+            return value
+    return "client"
+
+
 def _safe_dir(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._ -]", "_", name)[:60] or "agent"
 
@@ -59,6 +104,11 @@ def _base(request: httpd.Request) -> str:
         return config.PUBLIC_URL
     host = (request.headers.get("X-Forwarded-Host")
             or request.headers.get("Host") or "").split(",")[0].strip()
+    if config.ALLOWED_HOSTS:
+        bare = host.split(":")[0].lower()
+        if bare and bare not in config.ALLOWED_HOSTS:
+            # A spoofed Host would otherwise be baked into every installer line.
+            host = config.ALLOWED_HOSTS[0]
     proto = (request.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
     return f"{proto}://{host}".rstrip("/") if host else ""
 
@@ -75,6 +125,29 @@ def _update_archive(root: str) -> bytes:
 class Api:
     """Owns the hub, the settings and the HTTP application."""
 
+    def _cached_kit(self) -> bytes:
+        """Rebuild only when the tree changed. /wu/kit.zip used to walk and
+        SHA-256 the whole tree on every unauthenticated request."""
+        stamp = 0.0
+        for relative in ("agent.py", "bootstrap.py", "syspy", "install"):
+            path = os.path.join(self.root, relative)
+            try:
+                if os.path.isdir(path):
+                    for current, _dirs, files in os.walk(path):
+                        for name in files:
+                            stamp = max(stamp, os.path.getmtime(
+                                os.path.join(current, name)))
+                else:
+                    stamp = max(stamp, os.path.getmtime(path))
+            except OSError:
+                pass
+        with self._kit_lock:
+            if self._kit and self._kit_stamp == stamp:
+                return self._kit
+            self._kit = _update_archive(self.root)
+            self._kit_stamp = stamp
+            return self._kit
+
     def __init__(self, root: str) -> None:
         self.root = os.path.abspath(root)
         self.data_dir = os.environ.get("SYSPY_DATA") or os.path.join(self.root, "data")
@@ -86,6 +159,12 @@ class Api:
         self.app = httpd.Application()
         self._login_attempts: dict[str, list[float]] = {}
         self._tickets: dict[str, float] = {}
+        self._kit: bytes = b""
+        self._kit_stamp: float = -1.0
+        self._kit_lock = threading.Lock()
+        self._kit: bytes = b""
+        self._kit_stamp: float = -1.0
+        self._kit_lock = threading.Lock()
         self.app.static(os.path.join(os.path.dirname(__file__), "static"))
         self._register_routes()
 
@@ -122,6 +201,23 @@ class Api:
         except OSError:
             pass
 
+    def _presented_tokens(self, request: httpd.Request) -> list[str]:
+        presented = []
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            presented.append(auth[7:].strip())
+        header = request.headers.get("X-SysPy-Token", "")
+        if header:
+            presented.append(header)
+        for part in (request.headers.get("Cookie", "") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == SESSION_COOKIE and value:
+                presented.append(value)
+        query_token = request.param("token", "")
+        if query_token:
+            presented.append(query_token)
+        return [p for p in presented if p]
+
     def authenticate(self, request: httpd.Request) -> bool:
         """Check the session token or bearer header."""
         now = time.time()
@@ -142,6 +238,8 @@ class Api:
         if query_token:
             presented.append(query_token)
 
+        presented = presented or []
+        presented = presented or []
         for entry in self.state.get("tokens", []):
             token = entry["token"] if isinstance(entry, dict) else entry
             issued = entry.get("at", 0) if isinstance(entry, dict) else now
@@ -163,11 +261,7 @@ class Api:
             # X-Forwarded-For is client-supplied. Only believe it behind a
             # proxy that overwrites it, otherwise every request can pick a new
             # bucket and the limiter does nothing.
-            if os.environ.get("SYSPY_TRUST_PROXY") == "1":
-                ip = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-            else:
-                ip = (request.headers.get("X-Real-IP") or "").strip()
-            ip = ip or "client"
+            ip = _client_ip(request)
             now = time.time()
             attempts = [t for t in self._login_attempts.get(ip, []) if now - t < 60]
             if len(attempts) >= 10:
@@ -192,12 +286,16 @@ class Api:
             response = None
             live = [t for t in self.state["tokens"]
                     if isinstance(t, dict) and now_ts - t.get("at", 0) < TOKEN_TTL]
-            live.append({"token": token, "at": now_ts})
+            label = (payload.get("label") or request.headers.get("User-Agent") or "")[:60]
+            live.append({"token": token, "at": now_ts, "label": label})
             self.state["tokens"] = live[-200:]
             self._save_state()
             response = httpd.Response.json(200, {"token": token})
+            secure = "; Secure" if (request.headers.get("X-Forwarded-Proto") == "https"
+                                    or request.param("secure") == "1") else ""
             response.headers["Set-Cookie"] = (
-                f"{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={TOKEN_TTL}")
+                f"{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; "
+                f"Max-Age={TOKEN_TTL}{secure}")
             return response
 
         @app.route("POST", "/api/agent/delete")
@@ -291,13 +389,38 @@ class Api:
 
         @app.route("POST", "/api/logout")
         def logout(request: httpd.Request) -> httpd.Response:
+            """Revoke the presented token only, unless all=1.
+
+            Clearing the whole list used to log you out of every device.
+            """
             if not self.authenticate(request):
                 return httpd.Response.json(401, {"error": "unauthorised"})
-            self.state["tokens"] = []
+            payload = request.json()
+            presented = self._presented_tokens(request)
+            if payload.get("all"):
+                self.state["tokens"] = []
+            else:
+                self.state["tokens"] = [
+                    entry for entry in self.state["tokens"]
+                    if not (isinstance(entry, dict) and entry.get("token") in presented)
+                ]
             self._save_state()
-            response = httpd.Response.json(200, {"ok": True})
-            response.headers["Set-Cookie"] = f"{SESSION_COOKIE}=; Path=/; Max-Age=0"
+            response = httpd.Response.json(200, {"ok": True,
+                                                 "revoked": len(presented)})
+            response.headers["Set-Cookie"] = (
+                f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
             return response
+
+        @app.route("GET", "/api/sessions")
+        def sessions(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            now = time.time()
+            return httpd.Response.json(200, {"sessions": [
+                {"label": entry.get("label", ""), "age": int(now - entry.get("at", now)),
+                 "current": entry.get("token") in self._presented_tokens(request)}
+                for entry in self.state.get("tokens", []) if isinstance(entry, dict)
+            ]})
 
         @app.route("GET", "/api/health")
         def health(request: httpd.Request) -> httpd.Response:
@@ -307,6 +430,7 @@ class Api:
                 "agents": len(self.hub.agents),
                 "queued": len(self.hub._outbox),
                 "outbox_depth": len(self.hub._outbox),
+                "counters": self.hub.counters_snapshot(),
             })
 
         @app.route("GET", "/api/logs")
@@ -351,6 +475,8 @@ class Api:
 
         @app.route("GET", "/wu")
         def wu(request: httpd.Request) -> httpd.Response:
+            if config.WU_TOKEN and request.param("k") != config.WU_TOKEN:
+                return httpd.Response.json(403, {"error": "bad or missing ?k="})
             script = webinstall.render(
                 base=request.param("base") or _base(request),
                 group=request.param("group"),
@@ -358,7 +484,10 @@ class Api:
                 protect=request.param("protect", "1") != "0",
                 elevate=request.param("elevate", "1") != "0",
             )
-            return httpd.Response(200, script.encode("utf-8"), "text/plain; charset=utf-8")
+            response = httpd.Response(200, script.encode("utf-8"),
+                                      "text/plain; charset=utf-8")
+            response.headers["Cache-Control"] = "no-store"
+            return response
 
         @app.route("GET", "/wu.cmd")
         def wu_cmd(request: httpd.Request) -> httpd.Response:
@@ -371,8 +500,41 @@ class Api:
 
         @app.route("GET", "/wu/kit.zip")
         def wu_kit(request: httpd.Request) -> httpd.Response:
-            archive = _update_archive(self.root)
-            return httpd.Response(200, archive, "application/zip")
+            archive = self._cached_kit()
+            digest = hashlib.sha256(archive).hexdigest()
+            if request.headers.get("If-None-Match") == '"%s"' % digest:
+                return httpd.Response(304, b"", "application/zip")
+            response = httpd.Response(200, archive, "application/zip")
+            response.headers["ETag"] = '"%s"' % digest
+            response.headers["Cache-Control"] = "no-cache"
+            return response
+
+        @app.route("GET", "/wu/kit.meta")
+        def wu_kit_meta(request: httpd.Request) -> httpd.Response:
+            """Integrity/signature material for the kit, so an installer can
+            verify before it extracts anything."""
+            archive = self._cached_kit()
+            payload = {
+                "sha256": hashlib.sha256(archive).hexdigest(),
+                "hmac": crypto.hmac_hex(
+                    crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), archive),
+                "sig": _sign_kit(archive),
+                "pubkey": config.PUBKEY_HEX,
+                "bytes": len(archive),
+            }
+            return httpd.Response.json(200, payload)
+
+        @app.route("GET", "/wu/config")
+        def wu_config(request: httpd.Request) -> httpd.Response:
+            """The deployment material, for installers that would rather fetch
+            than have it embedded in a script."""
+            return httpd.Response.json(200, {
+                "room": config.ROOM,
+                "pass": config.PASSPHRASE,
+                "fmt": config.ENVELOPE_FMT,
+                "proto": config.PROTOCOL_VERSION,
+                "pubkey": config.PUBKEY_HEX,
+            })
 
         @app.route("GET", "/wu/py.zip")
         def wu_py(request: httpd.Request) -> httpd.Response:
@@ -439,9 +601,20 @@ class Api:
             filename = request.param("name", "upload.bin")
             if not request.body:
                 return httpd.Response.json(400, {"error": "empty body"})
-            chunks = self.hub.send_chunks(agent_id, "put", request.body,
-                                          filename=filename, destination=destination)
-            return httpd.Response.json(200, {"chunks": chunks.get("chunks", 0), "bytes": len(request.body)})
+            body = request.body
+
+            def _send() -> None:
+                try:
+                    self.hub.send_chunks(agent_id, "put", body,
+                                         filename=filename, destination=destination)
+                except Exception as error:
+                    log.get("api").warning("upload to %s failed: %s", agent_id, error)
+
+            threading.Thread(target=_send, name="upload", daemon=True).start()
+            return httpd.Response.json(200, {
+                "bytes": len(body), "async": True,
+                "chunks": max(1, (len(body) + config.CHUNK_SIZE - 1) // config.CHUNK_SIZE),
+            })
 
         @app.route("POST", "/api/download")
         def download(request: httpd.Request) -> httpd.Response:
@@ -483,6 +656,9 @@ class Api:
                     ]
             return httpd.Response.json(200, tree)
 
+        INLINE = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
+                  ".woff", ".woff2", ".ttf", ".mp3", ".wav"}
+
         @app.route("GET", "/files/{agent}/{name}")
         def serve_file(request: httpd.Request) -> httpd.Response:
             # Was unauthenticated: the URL alone was the only access control.
@@ -496,7 +672,15 @@ class Api:
                 return httpd.Response.json(403, {"error": "forbidden"})
             if not os.path.isfile(candidate):
                 return httpd.Response.json(404, {"error": "not found"})
-            return httpd.Response.file(candidate)
+            extension = os.path.splitext(candidate)[1].lower()
+            response = httpd.Response.file(candidate)
+            if extension not in INLINE:
+                # An agent-supplied .html served inline executes in the
+                # dashboard origin, with the session cookie in scope. Making it
+                # an attachment is the cheap, total fix.
+                response.headers["Content-Disposition"] = (
+                    'attachment; filename="%s"' % os.path.basename(candidate))
+            return response
 
         @app.route("GET", "/received/{agent}/{name}")
         def serve_received(request: httpd.Request) -> httpd.Response:
@@ -563,6 +747,28 @@ class Api:
             if time.time() - last_ping > 25:
                 last_ping = time.time()
                 socket.ping()
+
+
+def _sign_kit(archive: bytes) -> str:
+    if config.SIGN_KEY_HEX:
+        try:
+            from .. import ed25519
+            return ed25519.sign(archive, bytes.fromhex(config.SIGN_KEY_HEX)).hex()
+        except Exception:
+            pass
+    return crypto.hmac_hex(
+        crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), archive)
+
+
+def _sign_kit(archive: bytes) -> str:
+    if config.SIGN_KEY_HEX:
+        try:
+            from .. import ed25519
+            return ed25519.sign(archive, bytes.fromhex(config.SIGN_KEY_HEX)).hex()
+        except Exception:
+            pass
+    return crypto.hmac_hex(
+        crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), archive)
 
 
 def create_app(root: str) -> httpd.Application:

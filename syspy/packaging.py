@@ -57,6 +57,40 @@ def build_zip(root: str, extra: dict[str, bytes] | None = None) -> bytes:
     return buffer.getvalue()
 
 
+def build_zip_from_dir(source: str, names: "Iterable[str]" = ()) -> bytes:
+    """Zip a loose directory, *with* a manifest.
+
+    ``bootstrap.py --install --kit <dir>`` used to build a manifest-less archive
+    and then hand it to a verifier that requires one, so that path always
+    raised "kit rejected".
+    """
+    wanted = list(names) or list(BUNDLE_FILES) + list(BUNDLE_DIRS)
+    buffer = io.BytesIO()
+    manifest: dict[str, str] = {}
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name in wanted:
+            path = os.path.join(source, name)
+            if os.path.isfile(path):
+                with open(path, "rb") as handle:
+                    data = handle.read()
+                manifest[name.replace(os.sep, "/")] = hashlib.sha256(data).hexdigest()
+                archive.writestr(name.replace(os.sep, "/"), data)
+            elif os.path.isdir(path):
+                for current, subdirs, files in os.walk(path):
+                    subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+                    for filename in files:
+                        if filename.endswith(SKIP_SUFFIXES):
+                            continue
+                        full = os.path.join(current, filename)
+                        relative = os.path.relpath(full, source).replace(os.sep, "/")
+                        with open(full, "rb") as handle:
+                            data = handle.read()
+                        manifest[relative] = hashlib.sha256(data).hexdigest()
+                        archive.writestr(relative, data)
+        archive.writestr(MANIFEST_NAME, json.dumps(manifest, indent=1).encode("utf-8"))
+    return buffer.getvalue()
+
+
 def verify_manifest(extracted_root: str) -> tuple[bool, str]:
     """Check an extracted bundle against its manifest."""
     manifest_path = os.path.join(extracted_root, MANIFEST_NAME)
