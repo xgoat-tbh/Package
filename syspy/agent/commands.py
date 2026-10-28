@@ -161,7 +161,15 @@ def cmd_persist_remove(agent, argument: str) -> str:
 @command("heal")
 def cmd_heal(agent, argument: str) -> str:
     restored = persistence.install_copies()
-    return f"restored {len(restored)} file(s)"
+    repaired = persistence.repair_from_kit()
+    return ("restored " + str(len(restored)) + " copy(ies), "
+            "repaired " + str(len(repaired)) + " file(s) from kit")
+
+
+@command("defender.status", "av.status")
+def cmd_defender_status(agent, argument: str) -> str:
+    from . import defender
+    return "\n".join(k.ljust(18) + " " + str(v) for k, v in defender.status().items())
 
 
 # --------------------------------------------------------------------------

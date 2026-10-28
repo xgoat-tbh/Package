@@ -7,6 +7,7 @@ __pycache__/
 # Distribution & build outputs
 dist/
 build/
+.buildenv/
 *.spec
 SysPy.zip
 
@@ -21,7 +22,14 @@ adopted.json
 # Temporary / scratch files
 *.log
 *.tmp
+*.bak
+*.bak-*
 .env
 .venv/
 env/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml

@@ -146,3 +146,54 @@ print()
 if FAILS:
     print(f"{len(FAILS)} FAILURE(S)"); sys.exit(1)
 print("preflight OK")
+
+
+# ---------------------------------------------------------------------------
+# v5.1.1 hotfix invariants
+# ---------------------------------------------------------------------------
+
+def _hotfix_checks() -> list:
+    import os as _os
+    problems = []
+    here = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+
+    try:
+        agent_src = open(_os.path.join(here, "agent.py"), encoding="utf-8").read()
+        if "dont_write_bytecode" not in agent_src:
+            problems.append("agent.py: bytecode caching still enabled")
+    except OSError as error:
+        problems.append("agent.py unreadable: " + str(error))
+
+    try:
+        from syspy.agent import persistence as _p
+        for name in ("repair_from_kit", "_exclude_from_defender"):
+            if not hasattr(_p, name):
+                problems.append("persistence." + name + " missing")
+    except Exception as error:
+        problems.append("persistence import failed: " + str(error))
+
+    try:
+        from syspy.agent import defender as _d
+        for name in ("excluded", "status", "add_exclusion"):
+            if not hasattr(_d, name):
+                problems.append("defender." + name + " missing")
+    except Exception as error:
+        problems.append("defender import failed: " + str(error))
+
+    try:
+        from syspy.agent import commands as _c
+        if not _c.resolve("defender.status"):
+            problems.append("defender.status command not registered")
+    except Exception as error:
+        problems.append("commands import failed: " + str(error))
+
+    return problems
+
+
+_HOTFIX_PROBLEMS = _hotfix_checks()
+for _problem in _HOTFIX_PROBLEMS:
+    print("  [hotfix] FAIL  " + _problem)
+if not _HOTFIX_PROBLEMS:
+    print("  [hotfix] OK    v5.1.1 defender/repair invariants")

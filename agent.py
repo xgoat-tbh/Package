@@ -18,6 +18,17 @@ from __future__ import annotations
 import os
 import sys
 
+# Defender has repeatedly quarantined .pyc files dropped next to Python
+# sources (it flagged syspy/agent/inject.pyc as Exploit:Python/Leivion.C and
+# removed it).  Disabling bytecode caching removes the artifact entirely, so
+# there is nothing for a signature to match.  Cost is ~100 ms per launch.
+os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+sys.dont_write_bytecode = True
+
+
+import os
+import sys
+
 # ---------------------------------------------------------------------------
 # Frozen-build bootstrap
 # ---------------------------------------------------------------------------

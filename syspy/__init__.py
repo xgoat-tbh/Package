@@ -14,7 +14,7 @@ Importing this package has no side effects.
 
 from __future__ import annotations
 
-__version__ = "5.1.0"      # the ONLY version. build_dist derives from this.
+__version__ = "5.1.1"      # the ONLY version. build_dist derives from this.
 __author__ = "SysPy"
 
 __all__ = ["__version__"]

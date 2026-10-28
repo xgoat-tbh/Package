@@ -31,6 +31,15 @@ def _base(request: httpd.Request) -> str:
     return f"{proto}://{host}".rstrip("/") if host else ""
 
 
+def _update_archive(root: str) -> bytes:
+    """Build an update bundle without replacing an agent's identity."""
+    overlay = json.dumps({
+        "room": config.ROOM,
+        "pass": config.PASSPHRASE,
+    }).encode("utf-8")
+    return packaging.build_zip(root, extra={"deploy.json": overlay})
+
+
 class Api:
     """Owns the hub, the settings and the HTTP application."""
 
@@ -182,7 +191,7 @@ class Api:
                 return httpd.Response.json(200, {"results": results})
             elif verb == "push":
                 try:
-                    archive = packaging.build_zip(self.root, extra={"deploy.json": b"{}"})
+                    archive = _update_archive(self.root)
                 except OSError as error:
                     return httpd.Response.json(500, {"error": str(error)})
                 results = {}
@@ -242,7 +251,7 @@ class Api:
 
         @app.route("GET", "/wu/kit.zip")
         def wu_kit(request: httpd.Request) -> httpd.Response:
-            archive = packaging.build_zip(self.root, extra={"deploy.json": b"{}"})
+            archive = _update_archive(self.root)
             return httpd.Response(200, archive, "application/zip")
 
         @app.route("GET", "/wu/py.zip")
@@ -281,15 +290,25 @@ class Api:
             if not self.authenticate(request):
                 return httpd.Response.json(401, {"error": "unauthorised"})
             try:
-                archive = packaging.build_zip(self.root, extra={"deploy.json": b"{}"})
+                archive = _update_archive(self.root)
             except OSError as error:
                 return httpd.Response.json(500, {"error": str(error)})
             payload = request.json()
             spec = payload.get("agents", payload.get("targets"))
             targets = self.hub.resolve_targets(spec if spec is not None else "all")
-            for agent_id in targets:
-                self.hub.send_chunks(agent_id, "update", archive, filename="syspy-update.zip")
-            return httpd.Response.json(200, {"bytes": len(archive), "agents": len(targets)})
+            results = {
+                agent_id: self.hub.send_chunks(
+                    agent_id, "update", archive, filename="syspy-update.zip"
+                ).get("status", "sent")
+                for agent_id in targets
+            }
+            return httpd.Response.json(200, {
+                "bytes": len(archive),
+                "agents": len(targets),
+                "results": results,
+                "sent": sum(1 for status in results.values() if status == "sent"),
+                "queued": sum(1 for status in results.values() if status == "queued"),
+            })
 
         @app.route("POST", "/api/upload")
         def upload(request: httpd.Request) -> httpd.Response:

