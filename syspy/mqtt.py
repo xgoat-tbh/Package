@@ -60,6 +60,8 @@ class MqttClient:
         self._alive = False
         self._keepalive = config.MQTT_KEEPALIVE
         self._pending: dict[int, tuple[str, bytes, float, int]] = {}
+        self._acked: dict[int, threading.Event] = {}
+        self.dropped = 0
 
     # -- connection ------------------------------------------------------
 
@@ -143,6 +145,28 @@ class MqttClient:
             self._pending[self._packet_id] = (topic, payload, time.time(), 0)
         self._send(PACKET_PUBLISH | (qos << 1), body + payload)
 
+    def publish_wait(self, topic: str, payload: bytes, qos: int = 1,
+                     timeout: float = 6.0) -> bool:
+        """Publish and block for the PUBACK. False means the broker never acked."""
+        if not self.alive:
+            return False
+        if not qos:
+            self.publish(topic, payload, 0)
+            return True
+        event = threading.Event()
+        self._packet_id = self._packet_id % 65535 + 1
+        pid = self._packet_id
+        self._acked[pid] = event
+        encoded = topic.encode("utf-8")
+        body = (struct.pack(">H", len(encoded)) + encoded
+                + struct.pack(">H", pid) + payload)
+        self._pending[pid] = (topic, payload, time.time(), 0)
+        self._send(PACKET_PUBLISH | 0x02, body)
+        try:
+            return event.wait(timeout)
+        finally:
+            self._acked.pop(pid, None)
+
     # -- internals -------------------------------------------------------
 
     def _send(self, header: int, body: bytes) -> None:
@@ -191,6 +215,9 @@ class MqttClient:
                     if len(body) >= 2:
                         pid = struct.unpack(">H", body[:2])[0]
                         self._pending.pop(pid, None)
+                        waiter = self._acked.get(pid)
+                        if waiter is not None:
+                            waiter.set()
                 elif kind == TYPE_PINGRESP:
                     continue
         except Exception:
@@ -221,6 +248,7 @@ class MqttClient:
                 if now - when < 5 or tries >= 4:
                     if tries >= 4:
                         self._pending.pop(pid, None)
+                        self.dropped += 1
                     continue
                 encoded = topic.encode("utf-8")
                 body = (struct.pack(">H", len(encoded)) + encoded

@@ -109,7 +109,14 @@ class Response:
             or "application/octet-stream"
         )
         response = cls(200, data, content_type)
-        response.headers["Cache-Control"] = "no-store"
+        response.headers["ETag"] = '"%x-%x"' % (len(data), int(os.path.getmtime(path)))
+        # Static assets were no-store: app.js (82 KB) and style.css came down
+        # again on every dashboard load.
+        if extension in (".js", ".css", ".png", ".jpg", ".jpeg", ".gif",
+                         ".webp", ".svg", ".ico", ".woff", ".woff2", ".ttf"):
+            response.headers["Cache-Control"] = "public, max-age=300"
+        else:
+            response.headers["Cache-Control"] = "no-store"
         return response
 
 
@@ -229,7 +236,18 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._write(response, include_body=method != "HEAD")
 
+    def _not_modified(self, etag: str) -> bool:
+        return bool(etag) and self.headers.get("If-None-Match") == etag
+
     def _write(self, response: Response, include_body: bool = True) -> None:
+        if response.status == 200 and self._not_modified(response.headers.get("ETag", "")):
+            self.send_response(304)
+            for key in ("ETag", "Cache-Control"):
+                if key in response.headers:
+                    self.send_header(key, response.headers[key])
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(response.status)
         for key, value in response.headers.items():
             self.send_header(key, value)

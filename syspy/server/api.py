@@ -10,11 +10,12 @@ import threading
 import time
 from typing import Any
 
-from .. import config, crypto, httpd, packaging, ws
+from .. import config, crypto, httpd, log, packaging, ws
 from .hub import Hub, safe_name
 from . import webinstall, runtime_cache
 
 STATE_FILE = "controller-state.json"
+TOKEN_TTL = 60 * 60 * 24 * 14
 
 
 def _safe_dir(name: str) -> str:
@@ -87,14 +88,22 @@ class Api:
 
     def authenticate(self, request: httpd.Request) -> bool:
         """Check the session token or bearer header."""
+        now = time.time()
+        presented = []
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
-            token = auth[7:].strip()
-            if token in self.state["tokens"]:
+            presented.append(auth[7:].strip())
+        header = request.headers.get("X-SysPy-Token", "")
+        if header:
+            presented.append(header)
+
+        for entry in self.state["tokens"]:
+            token = entry["token"] if isinstance(entry, dict) else entry
+            issued = entry.get("at", 0) if isinstance(entry, dict) else now
+            if now - issued > TOKEN_TTL:
+                continue
+            if token in presented:
                 return True
-        token = request.headers.get("X-SysPy-Token", "")
-        if token and token in self.state["tokens"]:
-            return True
         return False
 
     # ------------------------------------------------------------------
@@ -122,7 +131,11 @@ class Api:
             if ip in self._login_attempts:
                 self._login_attempts.pop(ip, None)
             token = secrets.token_urlsafe(24)
-            self.state["tokens"].append(token)
+            now_ts = time.time()
+            live = [t for t in self.state["tokens"]
+                    if isinstance(t, dict) and now_ts - t.get("at", 0) < TOKEN_TTL]
+            live.append({"token": token, "at": now_ts})
+            self.state["tokens"] = live[-200:]
             self._save_state()
             return httpd.Response.json(200, {"token": token})
 
@@ -155,6 +168,8 @@ class Api:
             if not command:
                 return httpd.Response.json(400, {"error": "empty command"})
             targets = self.hub.resolve_targets(spec if spec is not None else "all")
+            if not targets:
+                return httpd.Response.json(400, {"error": f"no such target: {spec!r}"})
             results = {a: self.hub.send(a, {"t": "cmd", "d": command}) for a in targets}
             return httpd.Response.json(200, {
                 "results": results,
@@ -222,6 +237,29 @@ class Api:
                 "queued": len(self.hub._outbox),
                 "outbox_depth": len(self.hub._outbox),
             })
+
+        @app.route("GET", "/api/logs")
+        def logs(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            try:
+                since = float(request.param("since", "0") or 0)
+            except ValueError:
+                since = 0.0
+            level = request.param("level", "").upper()
+            rows = [r for r in log.tail(500) if r["ts"] > since]
+            if level:
+                rows = [r for r in rows if r["level"] == level]
+            return httpd.Response.json(200, {"rows": rows, "counters": log.counters(),
+                                             "relay": self.hub.relay_up})
+
+        @app.route("GET", "/api/logs/agent")
+        def agent_logs(request: httpd.Request) -> httpd.Response:
+            if not self.authenticate(request):
+                return httpd.Response.json(401, {"error": "unauthorised"})
+            status = self.hub.send(request.param("agent", ""),
+                                   {"t": "cmd", "d": "log.tail 200"})
+            return httpd.Response.json(200, {"status": status})
 
         @app.route("GET", "/api/tree")
         def tree(request: httpd.Request) -> httpd.Response:

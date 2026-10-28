@@ -76,6 +76,32 @@ def verify_manifest(extracted_root: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+def verify_manifest_zip(bundle: "zipfile.ZipFile") -> tuple[bool, str]:
+    """Check a zip in memory. Rejects members the manifest does not list, so a
+    tampered archive cannot smuggle in a new ``sitecustomize.py``."""
+    try:
+        raw = bundle.read(MANIFEST_NAME)
+    except KeyError:
+        return False, "manifest missing"
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return False, "manifest unreadable"
+
+    names = {n for n in bundle.namelist() if n != MANIFEST_NAME}
+    allowed = set(manifest)
+    extra = names - allowed
+    if extra:
+        return False, "unlisted member: " + sorted(extra)[0]
+
+    for name, expected in manifest.items():
+        if name not in names:
+            return False, f"missing file: {name}"
+        if hashlib.sha256(bundle.read(name)).hexdigest() != expected:
+            return False, f"hash mismatch: {name}"
+    return True, "ok"
+
+
 def sha256(data: bytes) -> str:
     """Return the hex digest of ``data``."""
     return hashlib.sha256(data).hexdigest()

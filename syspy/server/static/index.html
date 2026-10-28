@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SysPy Console</title>
-<link rel="stylesheet" href="/static/style.css?v=5.1.1">
+<link rel="stylesheet" href="/static/style.css?v=5.2.0">
 <link rel="stylesheet" href="/static/mobile.css?v=5.1.1">
 <script defer src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
 </head>
@@ -72,6 +72,7 @@
         <button data-tab="files" class="tab">Files</button>
         <button data-tab="keys" class="tab">Keys</button>
         <button data-tab="system" class="tab">System</button>
+        <button data-tab="controller" class="tab">Controller</button>
       </nav>
     </header>
 
@@ -254,6 +255,23 @@
         </div>
       </div>
       <pre id="keys-output" class="terminal"></pre>
+    </section>
+
+    <section id="pane-controller" class="pane">
+      <div class="ctrl-toolbar">
+        <span id="ctrl-relay" class="badge">relay ?</span>
+        <select id="ctrl-level">
+          <option value="">All levels</option>
+          <option value="INFO">INFO+</option>
+          <option value="WARNING">WARNING+</option>
+          <option value="ERROR">ERROR only</option>
+        </select>
+        <button class="ghost sm" id="ctrl-pause">Pause</button>
+        <button class="ghost sm" id="ctrl-clear">Clear</button>
+        <button class="ghost sm" id="ctrl-copy">Copy</button>
+        <button class="ghost sm" id="ctrl-agent-log">Agent log</button>
+      </div>
+      <pre id="ctrl-output" class="terminal ctrl-output"></pre>
     </section>
 
     <section id="pane-system" class="pane">

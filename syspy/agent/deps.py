@@ -24,7 +24,7 @@ import urllib.request
 import zipfile
 from typing import Callable, Optional
 
-from .. import config
+from .. import config, log
 from . import runtime
 
 IS_WINDOWS = os.name == "nt"
@@ -69,7 +69,8 @@ def have(module: str) -> bool:
         importlib.invalidate_caches()
         importlib.import_module(module)
         return True
-    except Exception:
+    except Exception as error:
+        log.get("deps").warning("dependency probe failed: %s", error)
         return False
 
 
@@ -182,7 +183,8 @@ def _download_embedded_python(notify: Optional[Callable[[str], None]]) -> Option
     """Download and unpack an embeddable interpreter matching this process."""
     target = runtime.runtime_directory()
     os.makedirs(target, exist_ok=True)
-    archive = os.path.join(tempfile.gettempdir(), "syspy-embed.zip")
+    handle, archive = tempfile.mkstemp(prefix="syspy-embed-", suffix=".zip")
+    os.close(handle)
 
     for version in _embed_versions():
         try:
@@ -216,7 +218,8 @@ def _ensure_pip(python: str, notify: Optional[Callable[[str], None]]) -> tuple[b
     # An embeddable interpreter ignores site-packages until we tell it not to.
     _enable_site(python)
 
-    script = os.path.join(tempfile.gettempdir(), "syspy-get-pip.py")
+    handle, script = tempfile.mkstemp(prefix="syspy-get-pip-", suffix=".py")
+    os.close(handle)
     try:
         if not os.path.exists(script) or os.path.getsize(script) < 1024:
             _say(notify, "bootstrapping pip")
@@ -292,10 +295,20 @@ def _pip_install(python: str, requirements: list[str],
     base = ["-m", "pip", "install", "--disable-pip-version-check",
             "--no-warn-script-location", "--progress-bar", "off"]
 
+    # --user put packages in %APPDATA%\Python, which _extend_sys_path only
+    # patched for the current process - the camera worked once then broke.
+    # --target keeps them inside the bundle and survives a restart.
+    vendor = os.path.join(runtime.runtime_directory(), "Lib", "site-packages")
+    try:
+        os.makedirs(vendor, exist_ok=True)
+    except OSError:
+        vendor = ""
+    target = ["--target", vendor] if vendor else []
+
     last = ""
     for requirement in requirements:
-        for extra in (["--only-binary", ":all:"], [], ["--user"]):
-            code, output = _run_streaming(python, base + extra + [requirement],
+        for extra in (["--only-binary", ":all:"], []):
+            code, output = _run_streaming(python, base + extra + target + [requirement],
                                           timeout=config.DEP_INSTALL_TIMEOUT, notify=notify)
             if code == 0:
                 return True, "ok"

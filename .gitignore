@@ -33,3 +33,6 @@ venv/
 .ruff_cache/
 .coverage
 coverage.xml
+patch.py
+.patch-backup/
+requested_files_code.txt

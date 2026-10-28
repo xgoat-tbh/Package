@@ -122,6 +122,8 @@ if ($elevate -and -not (Test-Admin)) {
 
 New-Item -ItemType Directory -Force -Path $target | Out-Null
 Say "target: $target"
+$script:LOG = Join-Path $target 'install.log'
+Add-Content -Path $script:LOG -Value "start $(Get-Date -Format o) admin=$((Test-Admin)) base=$base"
 Stop-OldAgent
 
 # ---------------------------------------------------------------- stage
@@ -229,9 +231,11 @@ if ($leaf -ieq 'python.exe') {
     if (Test-Path $w) { $exe = $w }
 }
 
-$launchArgs = @() + $py.Pre + @((Join-Path $target 'agent.py'), '--hidden')
+$launchArgs = @() + $py.Pre + @((Join-Path $target 'agent.py'), '--hidden', '--no-elevate')
 Start-Process -FilePath $exe -ArgumentList $launchArgs -WindowStyle Hidden
 Say 'installed.'
+Add-Content -Path (Join-Path $target 'install.log') -Value (
+    "ok $(Get-Date -Format o) python=$exe target=$target elevated=$((Test-Admin))")
 }
 
 Install-SysPy
@@ -242,13 +246,21 @@ def render(base: str = "", room: str = "", passphrase: str = "", group: str = ""
            salt: str = "", target: str = "", protect: bool = True,
            elevate: bool = True) -> str:
     """Return the installer script with the deployment baked in."""
+    def esc(value: str) -> str:
+        """Escape for a single-quoted PowerShell string.
+
+        Only @@TARGET@@ used to be escaped; a passphrase containing an
+        apostrophe broke the whole one-liner.
+        """
+        return str(value).replace("'", "''")
+
     return (TEMPLATE
-            .replace("@@BASE@@", (base or config.PUBLIC_URL).rstrip("/"))
-            .replace("@@ROOM@@", room or config.ROOM)
-            .replace("@@PASS@@", passphrase or config.PASSPHRASE)
-            .replace("@@GROUP@@", group)
-            .replace("@@SALT@@", salt or secrets.token_hex(4))
-            .replace("@@TARGET@@", target.replace("'", "''"))
+            .replace("@@BASE@@", esc((base or config.PUBLIC_URL).rstrip("/")))
+            .replace("@@ROOM@@", esc(room or config.ROOM))
+            .replace("@@PASS@@", esc(passphrase or config.PASSPHRASE))
+            .replace("@@GROUP@@", esc(group))
+            .replace("@@SALT@@", esc(salt or secrets.token_hex(4)))
+            .replace("@@TARGET@@", esc(target))
             .replace("@@EMBED@@", getattr(config, "EMBED_VERSION", "3.12.8"))
             .replace("@@PROTECT@@", "$true" if protect else "$false")
             .replace("@@ELEVATE@@", "$true" if elevate else "$false"))

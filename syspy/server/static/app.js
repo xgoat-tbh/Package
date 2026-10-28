@@ -43,7 +43,15 @@ const state = {
   }
 };
 
-const $ = (id) => document.getElementById(id);
+/* A missing element used to throw during initialisation and kill every
+   binding after it. Missing ids now return an inert stub. */
+const _stub = new Proxy(function () {}, {
+  get: (t, k) => (k === Symbol.toPrimitive ? () => '' : (k === 'classList' ? _stub : _stub)),
+  set: () => true,
+  apply: () => _stub,
+  has: () => true,
+});
+const $ = (id) => document.getElementById(id) || _stub;
 
 const COMMAND_SUGGESTIONS = [
   "info", "shot", "shot 50", "ls", "ps", "wifi", "hist", "clip.get",
@@ -149,7 +157,14 @@ async function start() {
   connect();
 }
 
+let _backoff = 500;
+function nextDelay() {
+  _backoff = Math.min(Math.round(_backoff * 1.8), 30000);
+  return _backoff + Math.round(Math.random() * 400);
+}
+
 function connect() {
+  _backoff = 500;
   if (state.socket) {
     try { state.socket.close(); } catch(e) {}
   }
@@ -175,7 +190,7 @@ function connect() {
   socket.onclose = () => {
     clearInterval(pingInterval);
     setWsStatus(false);
-    setTimeout(connect, 1500);
+    setTimeout(connect, nextDelay());
   };
   socket.onopen = () => { /* wait for snapshot/relay event from server */ };
 }
@@ -2228,3 +2243,88 @@ if (state.token) start(); else $("login").classList.remove("hidden");
       sendCommand(user ? `lan.spread ${user} ${password} ${domain}` : "lan.spread");
     }
   };
+
+
+/* ===================================================================
+   P0-26 addendum: fullscreen-safe pointer mapping.
+
+   A fullscreened <img> is given position:fixed;inset:0;width:100%;height:100%;
+   object-fit:contain by the UA stylesheet, so the element box is the whole
+   viewport while the picture is letterboxed inside it. Dividing by
+   rect.width scaled every click toward the centre.
+   =================================================================== */
+function _contentRect(img) {
+  const r = img.getBoundingClientRect();
+  const nw = img.naturalWidth || 1, nh = img.naturalHeight || 1;
+  const fit = getComputedStyle(img).objectFit;
+  const scale = (fit === 'cover') ? Math.max(r.width / nw, r.height / nh)
+              : (fit === 'fill' || fit === 'none') ? r.width / nw
+              : Math.min(r.width / nw, r.height / nh);
+  return { x: r.left + (r.width - nw * scale) / 2,
+           y: r.top + (r.height - nh * scale) / 2, scale };
+}
+
+function _toAgentCoords(ev, img) {
+  const c = _contentRect(img);
+  const nw = img.naturalWidth || 1, nh = img.naturalHeight || 1;
+  return {
+    x: Math.min(Math.max(Math.round((ev.clientX - c.x) / c.scale), 0), nw - 1),
+    y: Math.min(Math.max(Math.round((ev.clientY - c.y) / c.scale), 0), nh - 1),
+  };
+}
+
+function _screenPoint(ev) {
+  const img = document.getElementById('screen-img');
+  if (!img || !img.naturalWidth) return null;
+  return _toAgentCoords(ev, img);
+}
+
+(function () {
+  const img = document.getElementById('screen-img');
+  if (img) {
+    img.addEventListener('click', function (ev) {
+      if (!state.interactive || !state.selected) return;
+      const p = _screenPoint(ev);
+      if (!p) return;
+      ev.preventDefault();
+      send('mouse clickat ' + p.x + ' ' + p.y);
+    });
+    img.addEventListener('contextmenu', function (ev) {
+      if (!state.interactive || !state.selected) return;
+      const p = _screenPoint(ev);
+      if (!p) return;
+      ev.preventDefault();
+      send('mouse rightat ' + p.x + ' ' + p.y);
+    });
+  }
+
+  const btn = document.getElementById('fs-btn');
+  if (btn) {
+    btn.addEventListener('click', async function () {
+      const wrap = document.getElementById('screen-interactive-wrap');
+      if (!wrap) return;
+      try {
+        if (document.fullscreenElement) await document.exitFullscreen();
+        else await wrap.requestFullscreen();
+      } catch (e) { toast('fullscreen refused: ' + e.message); }
+      setTimeout(function () { if (img) img.focus(); }, 80);
+    });
+  }
+
+  document.addEventListener('fullscreenchange', function () {
+    const b = document.getElementById('fs-btn');
+    if (b) b.textContent = document.fullscreenElement ? 'Exit Fullscreen' : 'Fullscreen';
+    if (img) img.focus();
+  });
+
+  // Typing goes to the document while the screen tab is up; the <img> is not a
+  // reliable focus target.
+  document.addEventListener('keydown', function (ev) {
+    if (state.tab !== 'screen' || !state.interactive || !state.selected) return;
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    if (ev.key.length === 1 || ev.key === 'Enter' || ev.key === 'Backspace') {
+      ev.preventDefault();
+      send('type ' + (ev.key === 'Enter' ? '\n' : ev.key));
+    }
+  });
+})();

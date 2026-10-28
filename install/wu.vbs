@@ -1,5 +1,6 @@
-' Windowless launcher for the self-rebuilding shim.
-' wscript.exe never creates a console; cmd.exe /c does, on every logon.
+' Windowless launcher. wscript never creates a console.
+' The boot claim and the HIGHEST scheduled task own elevation, so the shim
+' itself must never raise a UAC prompt.
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh  = CreateObject("WScript.Shell")
 here = fso.GetParentFolderName(WScript.ScriptFullName)

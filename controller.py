@@ -18,7 +18,7 @@ import threading
 import time
 import webbrowser
 
-from syspy import __version__, config, httpd
+from syspy import __version__, config, httpd, log
 from syspy.server.api import Api
 
 STATIC_FILES = ("index.html", "app.js", "style.css")
@@ -136,6 +136,8 @@ def main(argv: list[str] | None = None) -> int:
 
     os.environ.setdefault("SYSPY_DATA", os.path.join(root, "data"))
     os.makedirs(os.environ["SYSPY_DATA"], exist_ok=True)
+    log.setup(os.path.join(os.environ["SYSPY_DATA"], "logs"), tag="controller")
+    log.get("controller").info("controller starting on %s:%s", args.host, args.port)
 
     missing = check_assets()
     if missing:

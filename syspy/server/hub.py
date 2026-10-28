@@ -6,6 +6,7 @@ listener and the HTTP API talk to it; nothing else holds agent state.
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ import time
 from typing import Any
 from urllib.parse import quote
 
-from .. import config, crypto, protocol
+from .. import config, crypto, log, protocol
 from ..mqtt import MqttClient, random_client_id
 
 
@@ -110,6 +111,9 @@ class Hub:
         self._dirty = False
         self._outbox: list[tuple[str, dict[str, Any]]] = []
         self._roster_sent: dict[str, float] = {}
+        self.counters = collections.Counter(
+            {"decrypt_fail": 0, "publish_timeout": 0, "publish_error": 0,
+             "outbox_overflow": 0, "ws_drop": 0})
 
         self._load_db()
         threading.Thread(target=self._flush_db_loop, name="hub-db-flush", daemon=True).start()
@@ -319,10 +323,17 @@ class Hub:
             return "queued"
         try:
             codec = self.codec_for(agent.remote_id)
-            self._client.publish(config.topic_down(agent.remote_id),
-                                 codec.encode(message), qos=1)
-            return "sent"
-        except Exception:
+            payload = codec.encode(message)
+            if self._client.publish_wait(config.topic_down(agent.remote_id), payload,
+                                         qos=1, timeout=6.0):
+                return "sent"
+            self.counters["publish_timeout"] += 1
+            log.get("hub").warning("no PUBACK for %s (%s)", agent_id, message.get("d", "")[:60])
+            self._enqueue(agent_id, message)
+            return "timeout"
+        except Exception as error:
+            self.counters["publish_error"] += 1
+            log.get("hub").warning("publish failed for %s: %s", agent_id, error)
             self._enqueue(agent_id, message)
             return "queued"
 
@@ -330,17 +341,22 @@ class Hub:
         self._outbox.append((agent_id, message))
         if len(self._outbox) > 5000:
             self._outbox = self._outbox[-5000:]
+            self.counters["outbox_overflow"] += 1
 
     def flush_outbox(self) -> int:
         if not self._client or not self._client.alive or not self._outbox:
             return 0
+        # Send from a copy and only clear what actually left, so an exception
+        # mid-loop cannot drop the remainder.
         flushed = 0
         pending = list(self._outbox)
-        self._outbox.clear()
-        for agent_id, message in pending:
-            res = self.send(agent_id, message)
-            if res == "sent":
+        for index, (agent_id, message) in enumerate(pending):
+            if self.send(agent_id, message) == "sent":
                 flushed += 1
+            else:
+                self._outbox = pending[index:]
+                return flushed
+        self._outbox = []
         return flushed
 
     def broadcast(self, message: dict[str, Any]) -> int:
@@ -384,6 +400,7 @@ class Hub:
             try:
                 message = self.codec.decode(payload)
             except Exception:
+                self.counters["decrypt_fail"] += 1
                 return
 
         if message.get("t") == "hello":

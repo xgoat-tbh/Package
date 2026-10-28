@@ -47,6 +47,12 @@ AUTO_INSTALL_DEPS = True
 #: Seconds between telemetry pushes.
 TELEMETRY_INTERVAL = 3.0
 
+#: Hard ceiling on concurrent command threads per agent.
+MAX_CONCURRENT_COMMANDS = int(os.environ.get("SYSPY_MAX_COMMANDS", "8"))
+
+#: Default shell timeout in seconds; 0 disables it.
+SHELL_TIMEOUT = float(os.environ.get("SYSPY_SHELL_TIMEOUT", "300"))
+
 #: Seconds between agent heartbeats.
 HEARTBEAT_INTERVAL = 10.0
 
