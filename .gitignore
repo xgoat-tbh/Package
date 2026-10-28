@@ -35,4 +35,5 @@ venv/
 coverage.xml
 patch.py
 .patch-backup/
+_patch_backup_*/
 requested_files_code.txt

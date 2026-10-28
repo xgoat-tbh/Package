@@ -65,7 +65,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
-import py_compile
 import re
 import shutil
 import subprocess
@@ -135,6 +134,9 @@ def sub(path: str, old: str, new: str, count: int = 1,
         return False
     body = read(path)
     if old not in body:
+        if new and new in body:
+            SKIPPED.append(f"{rel}: already applied ({label or old[:40]!r})")
+            return True
         if required:
             FAILED.append(f"{rel}: anchor not found {label or old[:60]!r}")
         else:
@@ -156,6 +158,9 @@ def sub_all(path: str, old: str, new: str, required: bool = True,
         return False
     body = read(path)
     if old not in body:
+        if new and new in body:
+            SKIPPED.append(f"{rel}: already applied ({label or old[:40]!r})")
+            return True
         if required:
             FAILED.append(f"{rel}: anchor not found {label or old[:60]!r}")
         else:
@@ -176,6 +181,9 @@ def rx(path: str, pattern: str, repl: str, count: int = 1,
     body = read(path)
     new_body, n = re.subn(pattern, repl, body, count=count, flags=flags)
     if n == 0:
+        if repl and repl in body:
+            SKIPPED.append(f"{rel}: already applied ({label or pattern[:40]!r})")
+            return True
         if required:
             FAILED.append(f"{rel}: regex not matched {label or pattern[:60]!r}")
         else:
@@ -4442,16 +4450,21 @@ if __name__ == "__main__":
 def compile_check() -> list[str]:
     problems = []
     for current, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "_patch_backup_x")]
-        if os.path.basename(current).startswith("_patch_backup"):
-            continue
+        dirs[:] = [
+            d for d in dirs
+            if d not in {".git", "__pycache__", ".patch-backup",
+                         ".buildenv", "build", "dist"}
+            and not d.startswith("_patch_backup")
+        ]
         for name in files:
             if not name.endswith(".py"):
                 continue
             full = os.path.join(current, name)
             try:
-                py_compile.compile(full, doraise=True, cfile=os.devnull)
-            except py_compile.PyCompileError as error:
+                with open(full, "rb") as handle:
+                    source = handle.read()
+                compile(source, full, "exec")
+            except (OSError, SyntaxError) as error:
                 problems.append(f"{os.path.relpath(full, ROOT)}: {error}")
     return problems
 
