@@ -413,13 +413,9 @@ class Hub:
             else:
                 codec = self.codec_for(agent.remote_id, agent.fmt or 1)
             payload = codec.encode(message)
-            if self._client.publish_wait(config.topic_down(agent.remote_id), payload,
-                                         qos=1, timeout=6.0):
-                return "sent"
-            self.counters["publish_timeout"] += 1
-            log.get("hub").warning("no PUBACK for %s (%s)", agent_id, message.get("d", "")[:60])
-            self._enqueue(agent_id, message)
-            return "timeout"
+            topic = config.topic_down(agent.remote_id)
+            self._client.publish(topic, payload, qos=1)
+            return "sent"
         except Exception as error:
             self.counters["publish_error"] += 1
             log.get("hub").warning("publish failed for %s: %s", agent_id, error)

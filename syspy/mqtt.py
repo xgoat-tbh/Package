@@ -153,7 +153,7 @@ class MqttClient:
         self._send(PACKET_SUBSCRIBE, payload)
         if not event.wait(timeout):
             return False
-        return self._suback_code == 0
+        return self._suback_code in (0, 1, 2)
 
     def publish(self, topic: str, payload: bytes, qos: int = 1) -> None:
         if not self.alive:
@@ -279,7 +279,8 @@ class MqttClient:
             log.get("mqtt").warning("malformed PUBLISH dropped: %s", error)
             return
         try:
-            self._on_message(topic, body[cursor:])
+            msg_payload = body[cursor:]
+            threading.Thread(target=self._on_message, args=(topic, msg_payload), daemon=True).start()
         except Exception:
             pass
 
