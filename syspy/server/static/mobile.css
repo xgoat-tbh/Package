@@ -1,34 +1,50 @@
-/* Mobile Responsive Overrides for SysPy Dashboard */
+/* Mobile Responsive Overrides for SysPy Nordic Terminal Dashboard */
 
-@media (max-width: 768px) {
+@media (max-width: 820px) {
   body {
-    flex-direction: column !important;
     overflow-y: auto !important;
   }
 
-  #sidebar, .sidebar {
+  .layout {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: auto 1fr !important;
+    height: 100dvh !important;
+    overflow-y: auto !important;
+  }
+
+  .sidebar {
     width: 100% !important;
     min-width: 100% !important;
-    max-height: 250px !important;
+    max-height: 280px !important;
     border-right: none !important;
-    border-bottom: 1px solid var(--border, #333) !important;
+    border-bottom: 1px solid var(--line) !important;
+    overflow-y: auto !important;
   }
 
-  #main, .main {
-    flex: 1 !important;
+  .main {
     width: 100% !important;
+    min-width: 0 !important;
+    overflow-x: hidden !important;
   }
 
-  .nav-tabs, .tabs {
+  .topbar {
     flex-wrap: wrap !important;
+    gap: 8px !important;
+    height: auto !important;
+    padding: 8px 12px !important;
   }
 
-  .header-actions {
+  .tabs {
     flex-wrap: wrap !important;
     gap: 4px !important;
   }
 
-  .terminal-container {
-    height: 350px !important;
+  .tabs button {
+    padding: 4px 8px !important;
+    font-size: 11px !important;
+  }
+
+  .term-container {
+    min-height: 300px !important;
   }
 }

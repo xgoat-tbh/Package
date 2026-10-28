@@ -268,16 +268,13 @@ function handleEvent(event) {
 }
 
 function upsertAgent(agent) {
-  // Smart detection: If there is an existing entry with identical hostname and MAC/IP, prune old one
-  const host = agent.display || agent.name || "";
+  // Smart detection: Prune old stale entry only when MAC hardware address matches exactly
   const mac = agent.mac || "";
-  if (host) {
+  if (mac) {
     for (const [existingId, existing] of state.agents.entries()) {
-      if (existingId !== agent.id && (existing.display === host || existing.name === host)) {
-        if ((mac && existing.mac && mac === existing.mac) || (existing.online === false && agent.online !== false)) {
-          state.agents.delete(existingId);
-          if (state.selected === existingId) state.selected = agent.id;
-        }
+      if (existingId !== agent.id && existing.mac && existing.mac === mac) {
+        state.agents.delete(existingId);
+        if (state.selected === existingId) state.selected = agent.id;
       }
     }
   }

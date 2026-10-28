@@ -110,8 +110,9 @@ DEP_INSTALL_TIMEOUT = 900
 
 GROUP = os.environ.get("SYSPY_GROUP", "")
 
-# single broker: mixed-broker agents never see each other
-BROKERS = [("broker.emqx.io", 8883, True)]
+# Default is empty for self-hosted broker setup (Mosquitto/EMQX Cloud).
+# Deployment must set SYSPY_BROKER=host:port:tls env var (e.g. localhost:8883:1).
+BROKERS: list[tuple[str, int, bool]] = []
 
 # --------------------------------------------------------------------------
 # Transport helpers (re‑added after the duplicate BROKERS line)

@@ -31,7 +31,8 @@ def config_surface():
         assert hasattr(c, name), f"config.{name} missing"
     assert c.topic_up("x").endswith("/up/x")
     assert c.topic_down("x").endswith("/down/x")
-    assert c.broker_order()
+    # In self-hosted configuration, BROKERS is empty by default unless SYSPY_BROKER is set
+    assert isinstance(c.broker_order(), list)
 
 def registry_path():
     from syspy import guardian
@@ -116,7 +117,18 @@ def controller_id_stable():
     from syspy import config as c
     assert c.controller_id() == c.controller_id()
 
-for name, fn in (("imports", imports), ("config surface", config_surface),
+
+def security_and_commands():
+    from syspy import crypto
+    assert hasattr(crypto, "subkey"), "crypto.subkey missing"
+    k = crypto.derive_key("test")
+    assert len(crypto.subkey(k, "id")) == 32
+    from syspy.agent import commands
+    for name in ("mic", "defender", "inject", "cloak"):
+        assert name in commands.REGISTRY, f"command {name} missing"
+    assert os.path.isfile(os.path.join(ROOT, "scripts", "hardening.ps1"))
+
+for name, fn in (("security and commands", security_and_commands), ("imports", imports), ("config surface", config_surface),
                  ("guardian registry path", registry_path),
                  ("persistence surface", persistence_surface),
                  ("kit completeness", zip_is_complete),

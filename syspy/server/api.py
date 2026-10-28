@@ -43,6 +43,7 @@ class Api:
                        db_path=os.path.join(self.data_dir, "agents_db.json"))
         self.state = self._load_state()
         self.app = httpd.Application()
+        self._login_attempts: dict[str, list[float]] = {}
         self.app.static(os.path.join(os.path.dirname(__file__), "static"))
         self._register_routes()
 
@@ -96,11 +97,21 @@ class Api:
 
         @app.route("POST", "/api/login")
         def login(request: httpd.Request) -> httpd.Response:
+            ip = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip() or "client"
+            now = time.time()
+            attempts = [t for t in self._login_attempts.get(ip, []) if now - t < 60]
+            if len(attempts) >= 10:
+                return httpd.Response.json(429, {"error": "too many attempts, try again later"})
+
             payload = request.json()
             entered = str(payload.get("password", "")).strip()
             stored = str(self.state.get("password", "")).strip()
             if entered != stored:
+                attempts.append(now)
+                self._login_attempts[ip] = attempts
                 return httpd.Response.json(401, {"error": "wrong password"})
+            if ip in self._login_attempts:
+                self._login_attempts.pop(ip, None)
             token = secrets.token_urlsafe(24)
             self.state["tokens"].append(token)
             self._save_state()
@@ -111,9 +122,7 @@ class Api:
             if not self.authenticate(request):
                 return httpd.Response.json(401, {"error": "unauthorised"})
             agent_id = request.json().get("agent", "")
-            if agent_id in self.hub.agents:
-                del self.hub.agents[agent_id]
-                self.hub._dirty = True
+            if self.hub.delete(agent_id):
                 return httpd.Response.json(200, {"ok": True})
             return httpd.Response.json(404, {"error": "not found"})
 

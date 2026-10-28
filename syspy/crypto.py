@@ -35,6 +35,16 @@ def derive_key(passphrase: str, salt: bytes = b"", iterations: int = 60_000) -> 
     )
 
 
+def subkey(master_key: bytes, context: str | bytes) -> bytes:
+    """Derive an agent-specific or purpose-specific 32-byte subkey using HKDF-Expand."""
+    if isinstance(context, str):
+        info = context.encode("utf-8")
+    else:
+        info = context
+    # HKDF-Expand with SHA-256 (RFC 5869)
+    return hmac.new(master_key, info + b"\x01", hashlib.sha256).digest()[:KEY_SIZE]
+
+
 def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
     """Expand ``key`` and ``nonce`` into ``length`` pseudo-random bytes."""
     blocks = (length + 31) // 32
