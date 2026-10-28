@@ -23,3 +23,5 @@ services:
         sync: false
       - key: SYSPY_PASS                 # same
         sync: false
+      - key: SYSPY_BROKER               # host:port:tls (e.g. broker.emqx.io:8883:1 or self-hosted Mosquitto)
+        sync: false

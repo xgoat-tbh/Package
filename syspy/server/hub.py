@@ -16,7 +16,7 @@ import time
 from typing import Any
 from urllib.parse import quote
 
-from .. import config, protocol
+from .. import config, crypto, protocol
 from ..mqtt import MqttClient, random_client_id
 
 
@@ -97,6 +97,7 @@ class Hub:
     def __init__(self, key: bytes, received_root: str, db_path: str = "") -> None:
         self.key = key
         self.codec = protocol.Codec(key)
+        self.codecs: dict[str, protocol.Codec] = {}
         self.agents: dict[str, AgentSession] = {}
         self.reassembler = protocol.Reassembler()
         self.received_root = os.path.abspath(received_root)
@@ -112,6 +113,14 @@ class Hub:
 
         self._load_db()
         threading.Thread(target=self._flush_db_loop, name="hub-db-flush", daemon=True).start()
+
+    def codec_for(self, identifier: str) -> protocol.Codec:
+        """Return a per-agent Codec derived via crypto.subkey, cached in self.codecs."""
+        ident = identifier[6:] if identifier.startswith("agent:") else identifier
+        if ident not in self.codecs:
+            sub = crypto.subkey(self.key, ident)
+            self.codecs[ident] = protocol.Codec(sub)
+        return self.codecs[ident]
 
     def _flush_db_loop(self) -> None:
         while self._running:
@@ -309,8 +318,9 @@ class Hub:
             self._enqueue(agent_id, message)
             return "queued"
         try:
+            codec = self.codec_for(agent.remote_id)
             self._client.publish(config.topic_down(agent.remote_id),
-                                 self.codec.encode(message), qos=1)
+                                 codec.encode(message), qos=1)
             return "sent"
         except Exception:
             self._enqueue(agent_id, message)
@@ -349,11 +359,11 @@ class Hub:
                                        "dest": destination, **part}
             if kind == "update":
                 message["sha"] = digest
-                message["proto"] = 2
+                message["proto"] = 1
             status = self.send(agent_id, message)
             if status == "sent":
                 sent_count += 1
-# no chunk sleep
+            time.sleep(0.005)
         return {
             "chunks": len(parts),
             "status": "sent" if sent_count == len(parts) else "queued"
@@ -364,13 +374,17 @@ class Hub:
     # ------------------------------------------------------------------
 
     def _on_message(self, topic: str, payload: bytes) -> None:
-        try:
-            message = self.codec.decode(payload)
-        except Exception:
-            return
-
         remote_id = topic.rsplit("/", 1)[-1]
         agent_id = "agent:" + remote_id
+
+        # Try per-agent subkey first, then fall back to master key for backward compatibility
+        try:
+            message = self.codec_for(remote_id).decode(payload)
+        except Exception:
+            try:
+                message = self.codec.decode(payload)
+            except Exception:
+                return
 
         if message.get("t") == "hello":
             self._register(agent_id, remote_id, message)

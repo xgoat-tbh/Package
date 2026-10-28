@@ -1,20 +1,30 @@
-# Hardening script: Restrict ACLs on the install directory
-# Grants full control to SYSTEM and Administrators, and read/execute only to standard Users.
+# Hardening script: Restrict ACLs using the asymmetric policy
+# Primary ($env:LOCALAPPDATA): (OI)(CI)(M) so unelevated self-heal works.
+# Anchor ($env:ProgramData): (OI)(CI)(RX) for standard users.
 
 param(
-    [string]$Path = "$env:LOCALAPPDATA\Microsoft\WindowsUpdate"
+    [string]$PrimaryPath = "$env:LOCALAPPDATA\Microsoft\WindowsUpdate",
+    [string]$AnchorPath = "$env:ProgramData\Microsoft\WindowsUpdate"
 )
 
-if (-not (Test-Path $Path)) {
-    Write-Host "Directory $Path does not exist."
-    exit 0
+Write-Host "Applying asymmetric ACL hardening..."
+
+if (Test-Path $PrimaryPath) {
+    try {
+        & icacls "$PrimaryPath" /grant "*S-1-5-32-545:(OI)(CI)(M)" "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /T /C /Q
+        Write-Host "Primary ACL applied: $PrimaryPath (Users: Modify)"
+    } catch {
+        Write-Host "Failed applying primary ACL: $_"
+    }
 }
 
-Write-Host "Applying restrictive ACLs to $Path..."
-try {
-    # Disable inheritance and copy rules, or reset to SYSTEM and Administrators
-    & icacls "$Path" /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "Users:(OI)(CI)RX" /T /C /Q
-    Write-Host "Hardening completed successfully."
-} catch {
-    Write-Host "Hardening failed: $_"
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if ($isAdmin -and (Test-Path $AnchorPath)) {
+    try {
+        & icacls "$AnchorPath" /grant "*S-1-5-32-545:(OI)(CI)(RX)" "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /T /C /Q
+        Write-Host "Anchor ACL applied: $AnchorPath (Users: Read/Execute)"
+    } catch {
+        Write-Host "Failed applying anchor ACL: $_"
+    }
 }

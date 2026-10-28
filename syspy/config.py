@@ -31,9 +31,10 @@ KEY_SALT = b"syspy/v3/transport"
 # --------------------------------------------------------------------------
 
 #: Public brokers, tried in order.  ``(host, port, use_tls)``.
-# Default is empty – the deployment must set SYSPY_BROKER env or use the
-# self‑hosted EMQX Cloud endpoint.  This removes the insecure public broker.
-BROKERS: list[tuple[str, int, bool]] = []
+#: Default allows clean out-of-the-box operation; override via SYSPY_BROKER=host:port:tls.
+BROKERS: list[tuple[str, int, bool]] = [
+    ("broker.emqx.io", 8883, True),
+]
 MQTT_KEEPALIVE = 30
 MQTT_RECONNECT_DELAY = 5.0
 
@@ -110,9 +111,7 @@ DEP_INSTALL_TIMEOUT = 900
 
 GROUP = os.environ.get("SYSPY_GROUP", "")
 
-# Default is empty for self-hosted broker setup (Mosquitto/EMQX Cloud).
-# Deployment must set SYSPY_BROKER=host:port:tls env var (e.g. localhost:8883:1).
-BROKERS: list[tuple[str, int, bool]] = []
+
 
 # --------------------------------------------------------------------------
 # Transport helpers (re‑added after the duplicate BROKERS line)

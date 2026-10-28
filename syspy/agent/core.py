@@ -27,12 +27,13 @@ class Agent:
     """
 
     def __init__(self) -> None:
-        self.key = crypto.derive_key(config.PASSPHRASE, config.KEY_SALT)
+        self.agent_id = config.agent_id()
+        master_key = crypto.derive_key(config.PASSPHRASE, config.KEY_SALT)
+        self.key = crypto.subkey(master_key, self.agent_id)
         self.codec = protocol.Codec(self.key)
         self.reassembler = protocol.Reassembler()
         self.health = health.Health()
 
-        self.agent_id = config.agent_id()
         self.hostname = socket.gethostname()
         self.cwd = os.path.expanduser("~")
         self.processes: set[Any] = set()
@@ -169,7 +170,7 @@ class Agent:
             self.send_json({"kind": "fs_op_result", "op": "upload", "success": False, "error": str(err)})
 
     def _receive_update(self, message: dict[str, Any]) -> None:
-        if int(message.get("proto", 0)) > 1:
+        if int(message.get("proto", 0)) > 2:
             self.reply("update rejected: controller protocol newer than agent")
             return
         data = self.reassembler.feed(message, time.time())

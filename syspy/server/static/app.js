@@ -430,68 +430,6 @@ function renderTree() {
 
 function renderAgents() {
   renderTree();
-  const list = $("agent-list");
-  if (!list) return;
-  list.innerHTML = "";
-  $("agent-count").textContent =
-    `${state.agents.size} HOST${state.agents.size === 1 ? "" : "S"}`;
-
-  for (const agent of state.agents.values()) {
-    const item = document.createElement("li");
-    if (agent.id === state.selected) item.classList.add("selected");
-    if (agent.online === false) item.classList.add("offline");
-
-    const cpu = Math.round((agent.stats && agent.stats.cpu) || 0);
-    const ram = Math.round((agent.stats && agent.stats.ram) || 0);
-    const statusTag = agent.online === false
-      ? `<span class="badge offline">OFFLINE</span>`
-      : `<span class="badge online">ONLINE</span>`;
-
-    const removeBtn = agent.online === false
-      ? `<button class="ghost sm del-agent-btn" title="Remove offline host" style="padding:1px 5px;margin-left:6px;font-size:10px;color:var(--err);border-color:var(--err);">✕</button>`
-      : "";
-
-    item.innerHTML = `
-      <div class="name-row">
-        <span class="name">${escapeHtml(agent.display)}</span>
-        <div style="display:flex;align-items:center;">
-          ${statusTag}
-          ${removeBtn}
-        </div>
-      </div>
-      <div class="sub">v${escapeHtml(agent.version)} - ${escapeHtml((agent.info && agent.info.system) || "")}</div>
-      <div class="bars">
-        <div class="bar" title="cpu ${cpu}%"><i style="width:${cpu}%"></i></div>
-        <div class="bar" title="ram ${ram}%"><i style="width:${ram}%;background:var(--warn)"></i></div>
-      </div>`;
-
-    const delBtn = item.querySelector(".del-agent-btn");
-    if (delBtn) {
-      delBtn.onclick = async (e) => {
-        e.stopPropagation();
-        if (confirm(`Remove offline host "${agent.display}" from list?`)) {
-          state.agents.delete(agent.id);
-          if (state.selected === agent.id) state.selected = Array.from(state.agents.keys())[0] || null;
-          await api("/api/agent/delete", { method: "POST", body: JSON.stringify({ agent: agent.id }) }).catch(() => {});
-          renderAgents();
-        }
-      };
-    }
-
-    item.onclick = () => {
-      state.selected = agent.id;
-      renderAgents();
-      renderHeader();
-      refreshFiles();
-    };
-    item.ondblclick = () => {
-      const nick = prompt("Rename Host Nickname:", agent.display);
-      if (nick !== null) {
-        api("/api/nick", { method: "POST", body: JSON.stringify({ agent: agent.id, nick }) });
-      }
-    };
-    list.appendChild(item);
-  }
   renderHeader();
 }
 
