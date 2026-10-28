@@ -214,11 +214,16 @@ def elevate_process(args: list[str] | None = None, wait: bool = False) -> bool:
 
             res = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei))
             if res and sei.hProcess:
-                ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 0xFFFFFFFF)
-                exit_code = wintypes.DWORD()
-                ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(exit_code))
-                ctypes.windll.kernel32.CloseHandle(sei.hProcess)
-                return exit_code.value == 0
+                try:
+                    while True:
+                        rc = ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 250)
+                        if rc != 0x0102:  # WAIT_TIMEOUT
+                            break
+                    exit_code = wintypes.DWORD()
+                    ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(exit_code))
+                    return exit_code.value == 0
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(sei.hProcess)
             return False
         else:
             ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 0)  # SW_HIDE

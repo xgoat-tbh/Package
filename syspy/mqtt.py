@@ -86,6 +86,10 @@ class MqttClient:
             context = ssl.create_default_context()
             sock = context.wrap_socket(sock, server_hostname=host)
         sock.settimeout(90)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except (OSError, AttributeError):
+            pass
         self._sock = sock
 
         flags = 0x02 if clean_session else 0x00
@@ -299,7 +303,11 @@ class MqttClient:
         while self._alive:
             time.sleep(self._keepalive / 2)
             if self._alive:
-                self._send(PACKET_PINGREQ, b"")
+                try:
+                    self._send(PACKET_PINGREQ, b"")
+                except Exception:
+                    self._alive = False
+                    break
 
 
 def random_client_id(prefix: str = "syspy") -> str:

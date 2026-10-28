@@ -36,8 +36,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--password", default="", help="dashboard password")
     parser.add_argument("--genkey", action="store_true",
                         help="print a fresh Ed25519 signing keypair and exit")
-    parser.add_argument("--genkey", action="store_true",
-                        help="print a fresh Ed25519 signing keypair and exit")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--stopall", "--stop", action="store_true",
                         help="stop all running controller processes and free port")
@@ -130,6 +128,21 @@ def check_assets() -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(list(sys.argv[1:] if argv is None else argv))
+    if args.genkey:
+        from syspy import ed25519
+        seed = os.urandom(32)
+        public = ed25519.publickey(seed)
+        print()
+        print("  Ed25519 signing keypair -- keep the seed secret, pin the public key")
+        print()
+        print("  SYSPY_SIGN_KEY =", seed.hex())
+        print("  SYSPY_PUBKEY   =", public.hex())
+        print()
+        print("  Put SYSPY_SIGN_KEY on the controller only.")
+        print("  Put SYSPY_PUBKEY on the controller AND bake it into the fleet")
+        print("  (agents read it from env or from deploy.json).")
+        print()
+        return 0
     if args.stopall:
         return stop_all_controllers(args.port)
 

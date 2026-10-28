@@ -86,11 +86,7 @@ class AgentSession:
         self.build = ""
         self.session = -1
         self.folder = ""
-        self.fmt = 1          # envelope format the agent last declared
-        self.proto = 1
-        self.build = ""
-        self.session = -1
-        self.folder = ""
+        self.use_master_key = False
         self.parent = ""
         self.hop = 0
         self.parent_ip = ""
@@ -137,6 +133,7 @@ class AgentSession:
             "subnet": self.subnet,
             "group": self.group,
             "health": self.health,
+            "use_master_key": getattr(self, "use_master_key", False),
         }
 
 
@@ -153,7 +150,7 @@ class Hub:
         self.db_path = db_path or os.path.join(self.received_root, "..", "agents_db.json")
         self._subscribers: list[queue.Queue[str]] = []
         self._folders: dict[str, str] = {}
-        self._folders: dict[str, str] = {}
+        self._master_key_agents: set[str] = set()
         self._lock = threading.Lock()
         self._client: MqttClient | None = None
         self.relay_up = False
@@ -205,6 +202,12 @@ class Hub:
                         session = AgentSession(agent_id, item.get("name", "agent"), item.get("remote_id", ""))
                         session.nick = item.get("nick", "")
                         session.version = item.get("version", "?")
+                        session.proto = int(item.get("proto") or 1)
+                        session.fmt = int(item.get("fmt") or 1)
+                        if session.proto < 2 or session.version == "5.1.1":
+                            session.use_master_key = True
+                            if session.remote_id:
+                                self._master_key_agents.add(session.remote_id)
                         session.sha = item.get("sha", "")
                         session.path = item.get("path", "")
                         session.pid = item.get("pid", 0)
@@ -401,7 +404,14 @@ class Hub:
             self._enqueue(agent_id, message)
             return "queued"
         try:
-            codec = self.codec_for(agent.remote_id, agent.fmt or 1)
+            is_legacy = (agent.remote_id in self._master_key_agents
+                         or getattr(agent, "use_master_key", False)
+                         or (agent.proto or 1) < 2
+                         or agent.version == "5.1.1")
+            if is_legacy:
+                codec = protocol.Codec(self.key, fmt=1)
+            else:
+                codec = self.codec_for(agent.remote_id, agent.fmt or 1)
             payload = codec.encode(message)
             if self._client.publish_wait(config.topic_down(agent.remote_id), payload,
                                          qos=1, timeout=6.0):
@@ -421,9 +431,6 @@ class Hub:
         if len(self._outbox) > 5000:
             self._outbox = self._outbox[-5000:]
             self.counters["outbox_overflow"] += 1
-
-    def counters_snapshot(self) -> dict:
-        return dict(self.counters) | {"seq": self.seq, "live_transfers": self.reassembler.live()}
 
     def counters_snapshot(self) -> dict:
         return dict(self.counters) | {"seq": self.seq, "live_transfers": self.reassembler.live()}
@@ -494,6 +501,9 @@ class Hub:
                 self.counters["replay_dropped"] += 1
                 return
             if reason == protocol.REASON_OK:
+                self._master_key_agents.discard(remote_id)
+                if known:
+                    known.use_master_key = False
                 break
         if message is None:
             # Always try master-key fallback. An agent installed before the
@@ -505,6 +515,9 @@ class Hub:
             try:
                 message = self.codec.decode(payload)
                 self.counters["master_key_fallback"] += 1
+                self._master_key_agents.add(remote_id)
+                if known:
+                    known.use_master_key = True
                 if remote_id not in self._fallback_warned:
                     self._fallback_warned.add(remote_id)
                     log.get("hub").warning(
@@ -584,6 +597,9 @@ class Hub:
         except (TypeError, ValueError):
             pass
         agent.version = message.get("ver", agent.version)
+        if remote_id in self._master_key_agents or agent.proto < 2 or agent.version == "5.1.1":
+            agent.use_master_key = True
+            self._master_key_agents.add(remote_id)
         agent.sha = message.get("sha", agent.sha)
         agent.path = message.get("path", agent.path)
         agent.pid = message.get("pid", agent.pid)

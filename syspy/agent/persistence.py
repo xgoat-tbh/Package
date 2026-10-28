@@ -317,33 +317,6 @@ def _write_run_keys(launcher: str) -> list[str]:
                 continue
     return written
 
-def purge() -> list[str]:
-    """Hard removal: remove everything including %PROGRAMDATA% anchor, runtime, deploy, and adopted states."""
-    removed = remove(keep_anchor=False)
-    if IS_WINDOWS:
-        removed += guardian.remove()
-        anchor = stealth.anchor_directory()
-        if os.path.isdir(anchor):
-            try:
-                shutil.rmtree(anchor, ignore_errors=True)
-                removed.append(f"removed anchor: {anchor}")
-            except OSError:
-                pass
-
-    for directory in stealth.install_directories():
-        for extra in ("runtime", "deploy.json", "adopted.json", "url.txt", "tombstone"):
-            path = os.path.join(directory, extra)
-            try:
-                if os.path.isdir(path):
-                    shutil.rmtree(path, ignore_errors=True)
-                    removed.append(f"purged {path}")
-                elif os.path.isfile(path):
-                    os.remove(path)
-                    removed.append(f"purged {path}")
-            except OSError:
-                pass
-    return removed
-
 
 def config_value_names() -> tuple[str, ...]:
     """Registry value names, imported lazily to keep this module standalone."""

