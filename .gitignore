@@ -34,6 +34,13 @@ venv/
 .coverage
 coverage.xml
 patch.py
+fix.py
+py.zip
+icon.ico
+icon.png
+make_ico.py
+build.bat
+deploy.json
 .patch-backup/
 _patch_backup_*/
 requested_files_code.txt
