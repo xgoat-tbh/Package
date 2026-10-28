@@ -365,6 +365,7 @@ function renderTree() {
           <span class="name" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(a.display)}</span>
           <span class="badge ${a.online === false ? "offline" : "online"}">${a.online === false ? "OFF" : "ON"}</span>
           <button class="ghost sm rename-btn" data-id="${a.id}" title="Rename">&#9998;</button>
+          <button class="ghost sm del-agent-btn" data-id="${a.id}" title="Delete machine from dashboard" style="padding:1px 5px;font-size:11px;color:var(--err,#e74c3c);border-color:var(--err,#e74c3c);margin-left:4px;">&#10005;</button>
         </div>
         <div class="sub" style="margin-left:22px;font-size:11px;opacity:0.7;">hop=${a.hop || 0} ${escapeHtml((a.info && a.info.system) || "")}</div>
         <div class="bars" style="margin-left:22px;">
@@ -392,6 +393,19 @@ function renderTree() {
           e.stopPropagation();
           const nick = prompt("Rename host:", a.display);
           if (nick !== null) api("/api/nick", { method: "POST", body: JSON.stringify({ agent: a.id, nick: nick.trim() }) });
+        };
+      }
+      const delBtn = item.querySelector(".del-agent-btn");
+      if (delBtn) {
+        delBtn.onclick = async (e) => {
+          e.stopPropagation();
+          if (confirm(`Remove machine "${a.display}" from dashboard?`)) {
+            state.agents.delete(a.id);
+            if (state.selected === a.id) state.selected = Array.from(state.agents.keys())[0] || null;
+            await api("/api/agent/delete", { method: "POST", body: JSON.stringify({ agent: a.id }) }).catch(() => {});
+            renderTree();
+            renderHeader();
+          }
         };
       }
 
