@@ -249,6 +249,17 @@ class Hub:
         self.publish({"type": "agent", "agent": data})
         return True
 
+    def delete(self, agent_id: str) -> bool:
+        """Explicitly delete an uninstalled / stale agent from the dashboard."""
+        with self._lock:
+            if agent_id in self.agents:
+                del self.agents[agent_id]
+                self._dirty = True
+            else:
+                return False
+        self.publish({"type": "agent_deleted", "id": agent_id})
+        return True
+
     def forget_stale(self, timeout: float = config.AGENT_TIMEOUT) -> list[str]:
         """Mark agents that stopped reporting as offline rather than deleting them."""
         now = time.time()
@@ -338,12 +349,11 @@ class Hub:
                                        "dest": destination, **part}
             if kind == "update":
                 message["sha"] = digest
-                message["proto"] = 1
+                message["proto"] = 2
             status = self.send(agent_id, message)
             if status == "sent":
                 sent_count += 1
-            if len(parts) > 4 and index % 4 == 0:
-                time.sleep(0.01)
+# no chunk sleep
         return {
             "chunks": len(parts),
             "status": "sent" if sent_count == len(parts) else "queued"

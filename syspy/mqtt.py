@@ -68,7 +68,8 @@ class MqttClient:
         return self._alive and self._sock is not None
 
     def connect(self, host: str, port: int, use_tls: bool, timeout: float = 12.0,
-                clean_session: bool = True, will_topic: str = "", will_payload: bytes = b"") -> None:
+                clean_session: bool = True, will_topic: str = "", will_payload: bytes = b"",
+                username: str = "", password: str = "") -> None:
         """Open the socket and perform the MQTT handshake."""
         sock = socket.create_connection((host, port), timeout=timeout)
         if use_tls:
@@ -82,8 +83,17 @@ class MqttClient:
         if will_topic:
             flags |= 0x04
             encoded_will = will_topic.encode("utf-8")
-            tail = (struct.pack(">H", len(encoded_will)) + encoded_will
-                    + struct.pack(">H", len(will_payload)) + will_payload)
+            tail += (struct.pack(">H", len(encoded_will)) + encoded_will
+                     + struct.pack(">H", len(will_payload)) + will_payload)
+
+        u = (username or getattr(config, "SYSPY_BROKER_USER", "")).encode("utf-8")
+        p = (password or getattr(config, "SYSPY_BROKER_PASS", "")).encode("utf-8")
+        if u:
+            flags |= 0x80
+            tail += struct.pack(">H", len(u)) + u
+        if p:
+            flags |= 0x40
+            tail += struct.pack(">H", len(p)) + p
 
         identifier = self.client_id.encode("ascii")
         payload = (

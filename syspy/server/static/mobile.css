@@ -1,0 +1,34 @@
+/* Mobile Responsive Overrides for SysPy Dashboard */
+
+@media (max-width: 768px) {
+  body {
+    flex-direction: column !important;
+    overflow-y: auto !important;
+  }
+
+  #sidebar, .sidebar {
+    width: 100% !important;
+    min-width: 100% !important;
+    max-height: 250px !important;
+    border-right: none !important;
+    border-bottom: 1px solid var(--border, #333) !important;
+  }
+
+  #main, .main {
+    flex: 1 !important;
+    width: 100% !important;
+  }
+
+  .nav-tabs, .tabs {
+    flex-wrap: wrap !important;
+  }
+
+  .header-actions {
+    flex-wrap: wrap !important;
+    gap: 4px !important;
+  }
+
+  .terminal-container {
+    height: 350px !important;
+  }
+}

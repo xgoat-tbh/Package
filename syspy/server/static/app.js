@@ -202,6 +202,14 @@ function handleEvent(event) {
       renderAgents();
       renderHeader();
       break;
+    case "agent_deleted":
+      state.agents.delete(event.id);
+      if (state.selected === event.id) {
+        state.selected = Array.from(state.agents.keys())[0] || null;
+      }
+      renderAgents();
+      renderHeader();
+      break;
     case "agent_lost":
     case "agent_offline":
       if (event.agent) {
@@ -260,6 +268,19 @@ function handleEvent(event) {
 }
 
 function upsertAgent(agent) {
+  // Smart detection: If there is an existing entry with identical hostname and MAC/IP, prune old one
+  const host = agent.display || agent.name || "";
+  const mac = agent.mac || "";
+  if (host) {
+    for (const [existingId, existing] of state.agents.entries()) {
+      if (existingId !== agent.id && (existing.display === host || existing.name === host)) {
+        if ((mac && existing.mac && mac === existing.mac) || (existing.online === false && agent.online !== false)) {
+          state.agents.delete(existingId);
+          if (state.selected === existingId) state.selected = agent.id;
+        }
+      }
+    }
+  }
   state.agents.set(agent.id, agent);
   if (!state.selected) state.selected = agent.id;
 }
