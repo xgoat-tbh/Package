@@ -496,19 +496,19 @@ class Hub:
             if reason == protocol.REASON_OK:
                 break
         if message is None:
-            # Master-key fallback only while an agent has not declared a format.
-            # An agent that HAS declared one and still fails is a real problem,
-            # not something to paper over silently.
-            if known is not None and known.fmt == 2:
-                self.counters["decrypt_fail"] += 1
-                return
+            # Always try master-key fallback. An agent installed before the
+            # per-agent subkey wiring may already have declared fmt=2 (from an
+            # old hello that got stored), but still encodes with the master key
+            # because it hasn't been updated yet. Dropping it silently would
+            # make all commands invisible in the dashboard. Once the agent is
+            # pushed the updated kit it will move to subkeys and fallback stops.
             try:
                 message = self.codec.decode(payload)
                 self.counters["master_key_fallback"] += 1
                 if remote_id not in self._fallback_warned:
                     self._fallback_warned.add(remote_id)
                     log.get("hub").warning(
-                        "agent %s decoded with the master key (fmt not declared)",
+                        "agent %s decoded with the master key (pre-update agent)",
                         remote_id)
             except Exception:
                 self.counters["decrypt_fail"] += 1
