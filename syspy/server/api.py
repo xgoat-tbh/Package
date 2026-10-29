@@ -14,8 +14,6 @@ from typing import Any
 
 import threading
 
-import threading
-
 from .. import config, crypto, httpd, log, packaging, ws
 from .hub import Hub, safe_name
 from . import webinstall, runtime_cache
@@ -73,25 +71,7 @@ def _client_ip(request: httpd.Request) -> str:
             return value
     return "client"
 
-
-def _client_ip(request: httpd.Request) -> str:
-    """Best-effort real client IP.
-
-    X-Forwarded-For is client-supplied, so believing it blindly lets every
-    request pick a fresh rate-limit bucket. Walk ``TRUST_PROXY_HOPS`` entries in
-    from the right instead, which is the only entry the last proxy added.
-    """
-    if config.TRUST_PROXY_HOPS > 0:
-        chain = [part.strip() for part in
-                 (request.headers.get("X-Forwarded-For") or "").split(",") if part.strip()]
-        if chain:
-            index = max(0, len(chain) - config.TRUST_PROXY_HOPS)
-            return chain[index]
-    for header in ("X-Real-IP", "CF-Connecting-IP"):
-        value = (request.headers.get(header) or "").strip()
-        if value:
-            return value
-    return "client"
+
 
 
 def _safe_dir(name: str) -> str:
@@ -159,9 +139,6 @@ class Api:
         self.app = httpd.Application()
         self._login_attempts: dict[str, list[float]] = {}
         self._tickets: dict[str, float] = {}
-        self._kit: bytes = b""
-        self._kit_stamp: float = -1.0
-        self._kit_lock = threading.Lock()
         self._kit: bytes = b""
         self._kit_stamp: float = -1.0
         self._kit_lock = threading.Lock()
@@ -584,12 +561,15 @@ class Api:
                 ).get("status", "sent")
                 for agent_id in targets
             }
-            return httpd.Response.json(200, {
+            sent_count = sum(1 for status in results.values() if status == "sent")
+            queued_count = sum(1 for status in results.values() if status == "queued")
+            return httpd.Response.json(200 if targets else 404, {
                 "bytes": len(archive),
                 "agents": len(targets),
                 "results": results,
-                "sent": sum(1 for status in results.values() if status == "sent"),
-                "queued": sum(1 for status in results.values() if status == "queued"),
+                "sent": sent_count,
+                "queued": queued_count,
+                "error": "no online agents to push to" if not targets else None,
             })
 
         @app.route("POST", "/api/upload")
@@ -759,16 +739,7 @@ def _sign_kit(archive: bytes) -> str:
     return crypto.hmac_hex(
         crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), archive)
 
-
-def _sign_kit(archive: bytes) -> str:
-    if config.SIGN_KEY_HEX:
-        try:
-            from .. import ed25519
-            return ed25519.sign(archive, bytes.fromhex(config.SIGN_KEY_HEX)).hex()
-        except Exception:
-            pass
-    return crypto.hmac_hex(
-        crypto.kit_hmac_key(config.ROOM, config.PASSPHRASE), archive)
+
 
 
 def create_app(root: str) -> httpd.Application:
