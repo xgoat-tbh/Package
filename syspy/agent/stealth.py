@@ -182,7 +182,10 @@ def elevate_process(args: list[str] | None = None, wait: bool = False) -> bool:
             script = os.path.join(root, "agent.py")
             if not os.path.isfile(script):
                 script = os.path.abspath(sys.argv[0])
-            params = f'"{script}" ' + " ".join(f'"{a}"' for a in cmd_args)
+            script_args = list(cmd_args)
+            if "--no-elevate" not in script_args:
+                script_args.append("--no-elevate")
+            params = f'"{script}" ' + " ".join(f'"{a}"' for a in script_args)
 
         if wait:
             class SHELLEXECUTEINFO(ctypes.Structure):
@@ -215,8 +218,9 @@ def elevate_process(args: list[str] | None = None, wait: bool = False) -> bool:
             res = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei))
             if res and sei.hProcess:
                 try:
-                    while True:
-                        rc = ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 250)
+                    deadline = time.time() + 45.0  # 45 second max wait
+                    while time.time() < deadline:
+                        rc = ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 300)
                         if rc != 0x0102:  # WAIT_TIMEOUT
                             break
                     exit_code = wintypes.DWORD()
@@ -452,61 +456,6 @@ def release_single_instance() -> None:
             os.remove(path)
         except OSError:
             pass
-
-
-# --------------------------------------------------------------------------
-# Patch: cross-session awareness (W7, C2, UAC)
-# --------------------------------------------------------------------------
-
-def _mutex_exists(name: str) -> bool:
-    """True when ``name`` is already held by a live process.
-
-    A Windows mutex is released by the kernel when its owner dies, so this is
-    accurate even after a crash -- which the pid file is not.
-    """
-    if not IS_WINDOWS:
-        return False
-    try:
-        handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
-        already = ctypes.windll.kernel32.GetLastError() in (183, 5)
-        if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)
-        return already
-    except Exception:
-        return False
-
-
-def agent_already_running() -> bool:
-    """True when some agent instance already owns the namespace.
-
-    Consulted *before* any elevation decision, so a sibling launcher never
-    raises a second UAC prompt just because an elevated agent exists that it
-    cannot see through the pid file.
-    """
-    if not IS_WINDOWS:
-        return False
-    if _mutex_exists(config.mutex_name()):
-        return True
-    owner = read_pid(lock_path())
-    return bool(owner) and owner != os.getpid() and process_alive(owner)
-
-
-def session_id(pid: int = 0) -> int:
-    from . import session as _session
-    return _session.session_of(pid or os.getpid())
-
-
-def is_headless() -> bool:
-    from . import session as _session
-    return _session.is_headless()
-
-
-def owner_is_headless() -> bool:
-    """True when the current lock owner lives in session 0."""
-    owner = read_pid(lock_path())
-    if not owner:
-        return False
-    return session_id(owner) == 0
 
 
 # --------------------------------------------------------------------------

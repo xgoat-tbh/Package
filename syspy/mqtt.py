@@ -206,7 +206,12 @@ class MqttClient:
         assert self._sock is not None
         chunks = bytearray()
         while len(chunks) < count:
-            piece = self._sock.recv(count - len(chunks))
+            try:
+                piece = self._sock.recv(count - len(chunks))
+            except OSError as err:
+                if not self._alive or getattr(err, "winerror", 0) in (10038, 10053, 10054):
+                    raise ConnectionError("connection closed") from None
+                raise
             if not piece:
                 raise ConnectionError("broker closed the connection")
             chunks += piece
@@ -252,8 +257,9 @@ class MqttClient:
                 elif kind == TYPE_PINGRESP:
                     continue
         except Exception as error:
-            # Was silent: a protocol error killed the connection with no trace.
-            log.get("mqtt").warning("read loop ended: %s", error)
+            # Only warn if the connection was alive and not intentionally closed
+            if self._alive:
+                log.get("mqtt").warning("read loop ended: %s", error)
         self._alive = False
 
     def _handle_publish(self, header: int, body: bytes) -> None:

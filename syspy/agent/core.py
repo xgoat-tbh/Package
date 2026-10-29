@@ -443,11 +443,11 @@ def main(argv: list[str] | None = None) -> int:
         if (stealth.IS_WINDOWS and not stealth.is_admin()
                 and os.environ.get("SYSPY_NO_UAC") != "1"
                 and "--no-elevate" not in argv):
-            print("[*] requesting Administrator privileges...")
+            print("[*] Requesting Administrator privileges for complete removal...")
             if stealth.elevate_process(argv, wait=True):
-                print("[+] done.")
+                print("[+] Uninstallation complete.")
                 return 0
-            print("[!] elevation declined - continuing user-level.")
+            print("[!] Elevation declined or unavailable - continuing with user-level removal.")
 
         print("Removing SysPy agent...")
         actions = persistence.purge() if hard else persistence.remove(keep_anchor=True)
