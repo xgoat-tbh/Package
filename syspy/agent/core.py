@@ -134,6 +134,7 @@ class Agent:
             "session": session.current_session(),
             "headless": session.is_headless(),
             "sha": self.self_sha,
+            "kit_sha": str(config._deploy().get("kit_sha") or ""),
             "path": self.bundle_entry,
             "pid": os.getpid(),
             "info": sysinfo.summary(),
@@ -210,7 +211,7 @@ class Agent:
             return
         try:
             self.reply("update: verifying")
-            ok, detail = updater.apply(data, message.get("sha", ""))
+            ok, detail = updater.apply(data, message.get("sha", ""), message.get("sig", ""))
             self.reply(f"update {detail}" if ok else f"update failed: {detail}")
         except Exception as error:
             self.reply(f"update failed: {error}")

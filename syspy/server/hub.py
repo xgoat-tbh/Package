@@ -78,6 +78,7 @@ class AgentSession:
         self.mac = ""
         self.subnet = ""
         self.group = ""
+        self.kit_sha = ""
         self.health: dict[str, Any] = {}
 
     @property
@@ -118,6 +119,7 @@ class AgentSession:
             "subnet": self.subnet,
             "group": self.group,
             "health": self.health,
+            "kit_sha": getattr(self, "kit_sha", ""),
             "use_master_key": getattr(self, "use_master_key", False),
         }
 
@@ -188,7 +190,7 @@ class Hub:
                         session.nick = item.get("nick", "")
                         session.version = item.get("version", "?")
                         session.proto = int(item.get("proto") or 1)
-                        session.fmt = int(item.get("fmt") or 1)
+                        session.fmt = int(item.get("fmt") or 2)
                         if session.proto < 2 or session.version == "5.1.1":
                             session.use_master_key = True
                             if session.remote_id:
@@ -210,6 +212,7 @@ class Hub:
                         session.mac = item.get("mac", "")
                         session.subnet = item.get("subnet", "")
                         session.group = item.get("group", "")
+                        session.kit_sha = item.get("kit_sha", "")
                         session.health = item.get("health", {})
                         self.agents[agent_id] = session
             except Exception:
@@ -573,7 +576,7 @@ class Hub:
                     "agent on topic %s claims id %s (topic wins)", remote_id, claimed)
         agent.remote_id = remote_id
         try:
-            agent.fmt = int(message.get("fmt") or agent.fmt or 1)
+            agent.fmt = int(message.get("fmt") or agent.fmt or 2)
         except (TypeError, ValueError):
             pass
         agent.proto = int(message.get("proto") or agent.proto or 1)
@@ -605,6 +608,7 @@ class Hub:
         agent.mac = message.get("mac", agent.mac)
         agent.subnet = message.get("subnet", agent.subnet)
         agent.group = message.get("group", agent.group)
+        agent.kit_sha = message.get("kit_sha", getattr(agent, "kit_sha", ""))
         agent.health = message.get("health", agent.health)
         self._dirty = True
 

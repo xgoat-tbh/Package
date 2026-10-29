@@ -52,7 +52,7 @@ BOOT_MARK = _boot_mark_path()
 #: url and installed_at were missing: one push erased the controller URL and
 #: the shim could never rebuild again.
 PRESERVED_DEPLOY_KEYS = ("salt", "parent", "parent_ip", "hop", "group",
-                         "protected", "url", "installed_at")
+                         "protected", "url", "installed_at", "kit_sha")
 
 
 def _sha256(data: bytes) -> str:
@@ -201,6 +201,7 @@ def apply(archive: bytes, expected_sha: str = "", expected_sig: str = "",
         return False, f"swap failed: {error}"
 
     try:
+        preserved_identity["kit_sha"] = digest[:12]
         _restore_identity(root, preserved_identity)
     except OSError as error:
         rollback()

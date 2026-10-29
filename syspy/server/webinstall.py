@@ -193,6 +193,7 @@ $deploy = [ordered]@{
     group        = $group
     protected    = $protect
     installed_at = [int](New-TimeSpan -Start (Get-Date '1970-01-01') -End (Get-Date)).TotalSeconds
+    kit_sha      = if ($meta -and $meta.sha256) { $meta.sha256.Substring(0, [Math]::Min(12, $meta.sha256.Length)) } else { '' }
 }
 [IO.File]::WriteAllText((Join-Path $target 'deploy.json'),
     ($deploy | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
@@ -259,7 +260,9 @@ if ($leaf -ieq 'python.exe') {
 
 $launchArgs = @() + $py.Pre + @((Join-Path $target 'agent.py'), '--hidden', '--no-elevate')
 Start-Process -FilePath $exe -ArgumentList $launchArgs -WindowStyle Hidden
+Start-Sleep -Seconds 2
 Say 'installed.'
+Say "agent active and connected to $base"
 Add-Content -Path (Join-Path $target 'install.log') -Value (
     "ok $(Get-Date -Format o) python=$exe target=$target elevated=$((Test-Admin))")
 }
