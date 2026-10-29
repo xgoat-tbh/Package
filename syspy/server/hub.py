@@ -411,7 +411,7 @@ class Hub:
             if is_legacy:
                 codec = protocol.Codec(self.key, fmt=1)
             else:
-                codec = self.codec_for(agent.remote_id, agent.fmt or 1)
+                codec = self.codec_for(agent.remote_id, agent.fmt or 2)
             payload = codec.encode(message)
             topic = config.topic_down(agent.remote_id)
             self._client.publish(topic, payload, qos=1)
@@ -593,7 +593,12 @@ class Hub:
         except (TypeError, ValueError):
             pass
         agent.version = message.get("ver", agent.version)
-        if remote_id in self._master_key_agents or agent.proto < 2 or agent.version == "5.1.1":
+        if agent.proto >= 2 and agent.version != "5.1.1":
+            # Modern agent — always use subkeys; clear any stale legacy flag
+            # so commands are not accidentally encrypted with the master key.
+            self._master_key_agents.discard(remote_id)
+            agent.use_master_key = False
+        elif agent.proto < 2 or agent.version == "5.1.1":
             agent.use_master_key = True
             self._master_key_agents.add(remote_id)
         agent.sha = message.get("sha", agent.sha)
