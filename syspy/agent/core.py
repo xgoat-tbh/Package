@@ -326,8 +326,10 @@ class Agent:
                     self.send({"t": "note", "d": "broker did not SUBACK the downlink topic"})
                 self._connected.set()
                 self.send({"t": "note", "d": f"connected via {host}:{port}"})
+                self.send(self.hello_payload())
                 return True
-            except Exception:
+            except Exception as err:
+                self._log.warning("connect to %s:%s (tls=%s) failed: %s", host, port, use_tls, err)
                 continue
         return False
 

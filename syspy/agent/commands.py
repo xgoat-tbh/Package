@@ -288,30 +288,42 @@ def cmd_clip_set(agent, argument: str) -> str:
 
 @command("fs.drives")
 def cmd_drives(agent, argument: str) -> None:
-    drives = files.list_drives()
-    special = files.get_special_folders()
-    agent.send_json({"kind": "drives", "drives": drives, "special_folders": special})
+    try:
+        drives = files.list_drives()
+        special = files.get_special_folders()
+        agent.send_json({"kind": "drives", "drives": drives, "special_folders": special})
+    except Exception as err:
+        agent.send_json({"kind": "drives", "drives": [], "special_folders": {}, "error": str(err)})
 
 
 @command("fs.list", "ls", "dir")
 def cmd_list(agent, argument: str) -> None:
-    target = argument.strip().strip('"') if argument else ""
-    listing = files.list_directory(target)
-    agent.send_json({"kind": "listing", **listing})
+    try:
+        target = argument.strip().strip('"') if argument else ""
+        listing = files.list_directory(target)
+        agent.send_json({"kind": "listing", **listing})
+    except Exception as err:
+        agent.send_json({"kind": "listing", "error": str(err), "items": [], "path": argument})
 
 
 @command("fs.prop", "fs.properties")
 def cmd_properties(agent, argument: str) -> None:
-    target = argument.strip().strip('"')
-    props = files.get_properties(target)
-    agent.send_json({"kind": "properties", **props})
+    try:
+        target = argument.strip().strip('"')
+        props = files.get_properties(target)
+        agent.send_json({"kind": "properties", **props})
+    except Exception as err:
+        agent.send_json({"kind": "properties", "error": str(err), "path": argument})
 
 
 @command("fs.read")
 def cmd_read(agent, argument: str) -> None:
-    target = argument.strip().strip('"')
-    res = files.read_file_content(target)
-    agent.send_json({"kind": "file_content", **res})
+    try:
+        target = argument.strip().strip('"')
+        res = files.read_file_content(target)
+        agent.send_json({"kind": "file_content", **res})
+    except Exception as err:
+        agent.send_json({"kind": "file_content", "error": str(err), "path": argument})
 
 
 @command("fs.save")

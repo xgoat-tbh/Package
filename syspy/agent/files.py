@@ -512,6 +512,7 @@ def save_file_content(path: str, content: str, expected_sha: str = "",
                 current_sha = hashlib.sha256(check_f.read()).hexdigest()
             if current_sha != expected_sha:
                 return {
+                    "success": False,
                     "error": "Concurrency conflict: This file has changed on the remote PC since you opened it.",
                     "conflict": True,
                     "current_sha": current_sha,
@@ -541,13 +542,38 @@ def save_file_content(path: str, content: str, expected_sha: str = "",
     # Atomic write to temporary file in the same directory, then replace
     temp_target = None
     try:
-        fd, temp_target = tempfile.mkstemp(dir=parent_dir, prefix="syspy_save_", suffix=".tmp")
-        with os.fdopen(fd, "wb") as tmp_f:
-            tmp_f.write(encoded_data)
-            tmp_f.flush()
-            os.fsync(tmp_f.fileno())
+        try:
+            fd, temp_target = tempfile.mkstemp(dir=parent_dir, prefix="syspy_save_", suffix=".tmp")
+            with os.fdopen(fd, "wb") as tmp_f:
+                tmp_f.write(encoded_data)
+                tmp_f.flush()
+                os.fsync(tmp_f.fileno())
 
-        os.replace(temp_target, target)
+            try:
+                os.replace(temp_target, target)
+            except (PermissionError, OSError):
+                # Fallback for Windows file locks or read-only attributes
+                try:
+                    import stat
+                    if os.path.exists(target):
+                        try:
+                            os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+                        except OSError:
+                            pass
+                    with open(target, "wb") as f_direct:
+                        f_direct.write(encoded_data)
+                    if temp_target and os.path.exists(temp_target):
+                        try:
+                            os.remove(temp_target)
+                        except OSError:
+                            pass
+                except Exception:
+                    raise
+        except (PermissionError, OSError):
+            # Direct write fallback if tempfile creation in parent_dir is forbidden
+            with open(target, "wb") as f_direct:
+                f_direct.write(encoded_data)
+
         new_sha = hashlib.sha256(encoded_data).hexdigest()
         return {
             "success": True,
@@ -563,7 +589,7 @@ def save_file_content(path: str, content: str, expected_sha: str = "",
                 os.remove(temp_target)
             except OSError:
                 pass
-        return {"error": f"Failed to save file: {err}"}
+        return {"success": False, "error": f"Failed to save file: {err}"}
 
 
 # --------------------------------------------------------------------------
@@ -574,36 +600,36 @@ def create_directory(path: str) -> dict[str, Any]:
     """Create a new directory on the remote PC."""
     raw = path.strip().strip('"').strip("'")
     if not raw:
-        return {"error": "Folder path cannot be empty."}
+        return {"success": False, "error": "Folder path cannot be empty."}
     target = os.path.abspath(os.path.expanduser(raw))
     name = os.path.basename(target)
     if any(c in '<>:"/\\|?*' for c in name):
-        return {"error": f"Folder name contains invalid characters (< > : \" / \\ | ? *): {name}"}
+        return {"success": False, "error": f"Folder name contains invalid characters (< > : \" / \\ | ? *): {name}"}
     try:
         if os.path.exists(target):
-            return {"error": f"Folder or file already exists: {target}"}
+            return {"success": False, "error": f"Folder or file already exists: {target}"}
         os.makedirs(target, exist_ok=False)
         return {"success": True, "path": target}
     except PermissionError:
         is_adm = bool(ctypes.windll.shell32.IsUserAnAdmin()) if IS_WINDOWS else False
         hint = "" if is_adm else " (Administrator rights required for protected paths like C:\\. Click 'Elevate to Admin')"
-        return {"error": f"Permission denied: Access denied to '{target}'{hint}"}
+        return {"success": False, "error": f"Permission denied: Access denied to '{target}'{hint}"}
     except Exception as err:
-        return {"error": str(err)}
+        return {"success": False, "error": str(err)}
 
 
 def create_file(path: str, initial_content: str = "") -> dict[str, Any]:
     """Create a new file on the remote PC."""
     raw = path.strip().strip('"').strip("'")
     if not raw:
-        return {"error": "File path cannot be empty."}
+        return {"success": False, "error": "File path cannot be empty."}
     target = os.path.abspath(os.path.expanduser(raw))
     name = os.path.basename(target)
     if any(c in '<>:"/\\|?*' for c in name):
-        return {"error": f"Filename contains invalid characters (< > : \" / \\ | ? *): {name}"}
+        return {"success": False, "error": f"Filename contains invalid characters (< > : \" / \\ | ? *): {name}"}
     try:
         if os.path.exists(target):
-            return {"error": f"File already exists: {target}"}
+            return {"success": False, "error": f"File already exists: {target}"}
         parent = os.path.dirname(target)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -613,44 +639,44 @@ def create_file(path: str, initial_content: str = "") -> dict[str, Any]:
     except PermissionError:
         is_adm = bool(ctypes.windll.shell32.IsUserAnAdmin()) if IS_WINDOWS else False
         hint = "" if is_adm else " (Administrator rights required for protected paths like C:\\. Click 'Elevate to Admin')"
-        return {"error": f"Permission denied: Access denied to '{target}'{hint}"}
+        return {"success": False, "error": f"Permission denied: Access denied to '{target}'{hint}"}
     except Exception as err:
-        return {"error": str(err)}
+        return {"success": False, "error": str(err)}
 
 
 def rename_item(old_path: str, new_name: str) -> dict[str, Any]:
     """Rename a file or directory."""
     src = os.path.abspath(os.path.expanduser(old_path.strip().strip('"')))
     if not os.path.exists(src):
-        return {"error": f"Source item not found: {src}"}
+        return {"success": False, "error": f"Source item not found: {src}"}
 
     # Clean new filename
     clean_name = os.path.basename(new_name.strip().strip('"'))
     if not clean_name:
-        return {"error": "Invalid destination name."}
+        return {"success": False, "error": "Invalid destination name."}
 
     dst = os.path.join(os.path.dirname(src), clean_name)
     if os.path.exists(dst):
-        return {"error": f"An item with name '{clean_name}' already exists in this folder."}
+        return {"success": False, "error": f"An item with name '{clean_name}' already exists in this folder."}
 
     try:
         os.rename(src, dst)
         return {"success": True, "old_path": src, "new_path": dst}
     except Exception as err:
-        return {"error": f"Rename failed: {err}"}
+        return {"success": False, "error": f"Rename failed: {err}"}
 
 
 def delete_item(path: str, permanent: bool = False) -> dict[str, Any]:
     """Delete a file or directory. Prefers Windows Recycle Bin unless permanent=True."""
     target = os.path.abspath(os.path.expanduser(path.strip().strip('"')))
     if not os.path.exists(target):
-        return {"error": f"Path not found: {target}"}
+        return {"success": False, "error": f"Path not found: {target}"}
 
     # Safety check: prevent deleting root drives
     if IS_WINDOWS and (len(target) <= 3 and target[1:3] in (":", ":\\")):
-        return {"error": "Safety violation: Cannot delete filesystem root drive."}
+        return {"success": False, "error": "Safety violation: Cannot delete filesystem root drive."}
     if not IS_WINDOWS and target in ("/", ""):
-        return {"error": "Safety violation: Cannot delete filesystem root."}
+        return {"success": False, "error": "Safety violation: Cannot delete filesystem root."}
 
     if not permanent and IS_WINDOWS:
         try:
@@ -675,7 +701,7 @@ def delete_item(path: str, permanent: bool = False) -> dict[str, Any]:
             os.remove(target)
         return {"success": True, "path": target, "recycled": False}
     except Exception as err:
-        return {"error": f"Deletion failed: {err}"}
+        return {"success": False, "error": f"Deletion failed: {err}"}
 
 
 def copy_or_move(sources: list[str], destination_dir: str, is_move: bool = False,

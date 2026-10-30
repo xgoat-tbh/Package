@@ -7,7 +7,10 @@ function getBackendBase() {
   if (urlParam) {
     localStorage.setItem("syspy_backend", urlParam.replace(/\/+$/, ""));
   }
-  return localStorage.getItem("syspy_backend") || window.location.origin;
+  const injected = (window.__SYSPY_CONFIG__ && window.__SYSPY_CONFIG__.backendUrl)
+    ? window.__SYSPY_CONFIG__.backendUrl.replace(/\/+$/, "")
+    : "";
+  return localStorage.getItem("syspy_backend") || injected || window.location.origin;
 }
 
 const state = {
@@ -239,6 +242,26 @@ function decodeReveal(el, finalText, durationMs = 160) {
 
 /* ------------------------------------------------------------------ */
 
+function resolveBackendUrl(url) {
+
+  if (!url) return "";
+
+  let base = (url.startsWith("http://") || url.startsWith("https://"))
+
+    ? url
+
+    : (getBackendBase() + (url.startsWith("/") ? url : "/" + url));
+
+  if (state.token && !base.includes("token=")) {
+
+    base += (base.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(state.token);
+
+  }
+
+  return base;
+
+}
+
 async function api(path, options = {}) {
 
   const headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
@@ -253,7 +276,17 @@ async function api(path, options = {}) {
 
   const type = response.headers.get("Content-Type") || "";
 
-  return type.includes("json") ? response.json() : response.text();
+  const body = type.includes("json") ? await response.json() : await response.text();
+
+  if (!response.ok) {
+
+    const msg = (body && typeof body === "object" && body.error) ? body.error : `HTTP ${response.status}`;
+
+    throw new Error(msg);
+
+  }
+
+  return body;
 
 }
 
@@ -273,7 +306,9 @@ async function sendCommand(command) {
 
   }
 
-  appendTerminal(state.selected, "$ " + command, "in");
+  const displayCmd = command.length > 120 ? command.slice(0, 100) + "... [truncated]" : command;
+
+  appendTerminal(state.selected, "$ " + displayCmd, "in");
 
   try {
 
@@ -285,6 +320,14 @@ async function sendCommand(command) {
 
     });
 
+    if (result && result.error) {
+
+      appendTerminal(state.selected, "✗ " + result.error, "err");
+
+      throw new Error(result.error);
+
+    }
+
     if (result && result.sent === 0 && result.queued > 0) {
 
       appendTerminal(state.selected, "⏳ queued — agent reconnecting, will deliver when online", "sys");
@@ -293,11 +336,17 @@ async function sendCommand(command) {
 
       appendTerminal(state.selected, "✗ agent not reachable — check connection", "err");
 
+      throw new Error("Agent not reachable");
+
     }
+
+    return result;
 
   } catch (e) {
 
     appendTerminal(state.selected, "✗ failed to send: " + e.message, "err");
+
+    throw e;
 
   }
 
@@ -443,7 +492,7 @@ async function connect() {
 
       method: 'POST',
 
-      headers: (typeof token !== 'undefined' && token) ? { Authorization: 'Bearer ' + token } : {},
+      headers: state.token ? { Authorization: 'Bearer ' + state.token } : {},
 
     });
 
@@ -466,7 +515,7 @@ async function connect() {
 
     encodeURIComponent(window.__wsTicket || '') +
 
-    (window.__wsTicket ? '' : '&token=' + encodeURIComponent(typeof token !== 'undefined' ? token : '')));
+    (window.__wsTicket ? '' : '&token=' + encodeURIComponent(state.token || '')));
 
   state.socket = socket;
 
@@ -506,7 +555,10 @@ async function connect() {
 
   };
 
-  socket.onopen = () => { /* wait for snapshot/relay event from server */ };
+  socket.onopen = () => {
+    setWsStatus(true);
+    _backoff = 500;
+  };
 
 }
 
@@ -1096,6 +1148,8 @@ function applyStats(id, stats) {
 
 function setRelay(up) {
 
+  state.relayUp = !!up;
+
   $("relay-dot").classList.toggle("up", !!up);
 
   $("relay-label").textContent = up ? "RELAY CONNECTED" : "RELAY DISCONNECTED";
@@ -1111,6 +1165,14 @@ function setWsStatus(connected) {
     $("relay-dot").classList.remove("up");
 
     $("relay-label").textContent = "DASHBOARD RECONNECTING...";
+
+  } else {
+
+    // WebSocket connected: restore relay status indicator
+
+    $("relay-dot").classList.toggle("up", !!state.relayUp);
+
+    $("relay-label").textContent = state.relayUp ? "RELAY CONNECTED" : "RELAY DISCONNECTED";
 
   }
 
@@ -1140,6 +1202,13 @@ function appendTerminal(id, text, kind) {
     Typewriter.stream(terminal, text, "ok");
   } else {
     Typewriter.stream(terminal, text, null);
+  }
+
+  const sysOutput = $("system-output");
+  if (sysOutput) {
+    const time = new Date().toLocaleTimeString();
+    sysOutput.textContent += `[${time}] ${text}\n`;
+    sysOutput.scrollTop = sysOutput.scrollHeight;
   }
 
 }
@@ -1316,7 +1385,9 @@ function showImage(url) {
 
   const image = $("screen-img");
 
-  const fullUrl = url + "?t=" + Date.now();
+  const resolved = resolveBackendUrl(url);
+
+  const fullUrl = resolved + (resolved.includes("?") ? "&" : "?") + "t=" + Date.now();
 
   image.src = fullUrl;
 
@@ -1458,13 +1529,7 @@ $("download-screen-btn").onclick = () => {
 
   if (!img.src) return toast("No image to download");
 
-  const a = document.createElement("a");
-
-  a.href = img.src;
-
-  a.download = `screenshot_${Date.now()}.png`;
-
-  a.click();
+  triggerBrowserDownload(img.src, `screenshot_${Date.now()}.png`);
 
 };
 
@@ -1636,13 +1701,25 @@ function handleJson(id, payload) {
 
   if (kind === "drives") {
 
+    if (payload.error) {
+
+      state.fe.drivesError = payload.error;
+
+      toast("Error fetching drives: " + payload.error);
+
+    } else {
+
+      state.fe.drivesError = null;
+
+    }
+
     state.fe.drives = payload.drives || [];
 
     state.fe.specialFolders = payload.special_folders || {};
 
     renderSidebar();
 
-    if (state.fe.currentPath === "This PC") {
+    if (state.fe.isThisPc || state.fe.currentPath === "This PC") {
 
       renderThisPc();
 
@@ -1700,9 +1777,19 @@ function handleJson(id, payload) {
 
   } else if (kind === "file_content") {
 
+    if (state.fe.editor._loadTimer) {
+
+      clearTimeout(state.fe.editor._loadTimer);
+
+      state.fe.editor._loadTimer = null;
+
+    }
+
     if (payload.error) {
 
       toast("Error loading file: " + payload.error);
+
+      $("fe-editor-status").textContent = "Error: " + payload.error;
 
       return;
 
@@ -1712,13 +1799,31 @@ function handleJson(id, payload) {
 
   } else if (kind === "save_result") {
 
+    if (state.fe.editor._saveTimer) {
+
+      clearTimeout(state.fe.editor._saveTimer);
+
+      state.fe.editor._saveTimer = null;
+
+    }
+
+    const saveBtn = $("fe-editor-save-btn");
+
+    if (saveBtn) saveBtn.disabled = false;
+
     if (payload.conflict) {
+
+      $("fe-editor-status").textContent = "Conflict detected";
 
       const overwrite = confirm("CONFLICT DETECTED: The file has been modified on the remote PC by another process since you opened it.\n\nDo you want to overwrite it anyway?");
 
       if (overwrite) {
 
         saveEditorContent(true);
+
+      } else {
+
+        $("fe-editor-status").textContent = "Save cancelled";
 
       }
 
@@ -1744,7 +1849,7 @@ function handleJson(id, payload) {
 
       toast("Save failed: " + (payload.error || "Unknown error"));
 
-      $("fe-editor-status").textContent = "Save failed";
+      $("fe-editor-status").textContent = "Save failed: " + (payload.error || "Unknown error");
 
     }
 
@@ -2280,7 +2385,15 @@ function renderThisPc() {
 
   if (!drives.length) {
 
-    grid.innerHTML = `<div class="muted" style="padding:16px;">Scanning host drives...</div>`;
+    if (state.fe.drivesError) {
+
+      grid.innerHTML = `<div class="muted" style="padding:16px;">Failed to scan drives: ${escapeHtml(state.fe.drivesError)} <button class="sm ghost" onclick="refreshFiles()" style="margin-left:8px;">Retry</button></div>`;
+
+    } else {
+
+      grid.innerHTML = `<div class="muted" style="padding:16px;">Scanning host drives...</div>`;
+
+    }
 
     return;
 
@@ -2810,7 +2923,29 @@ function openFileInEditor(path) {
 
   $("fe-editor-status").textContent = "Loading file from host...";
 
-  sendCommand(`fs.read "${path}"`);
+  if (state.fe.editor._loadTimer) clearTimeout(state.fe.editor._loadTimer);
+
+  state.fe.editor._loadTimer = setTimeout(() => {
+
+    if ($("fe-editor-status").textContent === "Loading file from host...") {
+
+      $("fe-editor-status").textContent = "Load timed out";
+
+      toast("File load timed out: host did not respond");
+
+    }
+
+  }, 12000);
+
+  sendCommand(`fs.read "${path}"`).catch((err) => {
+
+    if (state.fe.editor._loadTimer) clearTimeout(state.fe.editor._loadTimer);
+
+    $("fe-editor-status").textContent = "Load failed";
+
+    toast("Load failed: " + err.message);
+
+  });
 
 }
 
@@ -2956,13 +3091,43 @@ function getEditorText() {
 
 }
 
-function saveEditorContent(forceOverwrite = false) {
+async function saveEditorContent(forceOverwrite = false) {
 
-  if (!state.fe.editor.path || !state.selected) return;
+  if (!state.fe.editor.path || !state.selected) {
+
+    toast("No file or host selected");
+
+    return;
+
+  }
 
   const content = getEditorText();
 
+  const saveBtn = $("fe-editor-save-btn");
+
+  if (saveBtn) saveBtn.disabled = true;
+
   $("fe-editor-status").textContent = "Saving to host...";
+
+  if (state.fe.editor._saveTimer) {
+
+    clearTimeout(state.fe.editor._saveTimer);
+
+  }
+
+  state.fe.editor._saveTimer = setTimeout(() => {
+
+    if ($("fe-editor-status").textContent === "Saving to host...") {
+
+      $("fe-editor-status").textContent = "Save timed out";
+
+      toast("Save timed out: host did not confirm file write");
+
+      if (saveBtn) saveBtn.disabled = false;
+
+    }
+
+  }, 12000);
 
   const payload = {
 
@@ -2978,7 +3143,27 @@ function saveEditorContent(forceOverwrite = false) {
 
   };
 
-  sendCommand(`fs.save ${JSON.stringify(payload)}`);
+  try {
+
+    await sendCommand(`fs.save ${JSON.stringify(payload)}`);
+
+  } catch (err) {
+
+    if (state.fe.editor._saveTimer) {
+
+      clearTimeout(state.fe.editor._saveTimer);
+
+      state.fe.editor._saveTimer = null;
+
+    }
+
+    $("fe-editor-status").textContent = "Save failed";
+
+    toast("Save failed: " + (err.message || "Failed to send command"));
+
+    if (saveBtn) saveBtn.disabled = false;
+
+  }
 
 }
 
@@ -3004,7 +3189,13 @@ $("fe-editor-reload-btn").onclick = () => {
 
   if (state.fe.editor.isModified && !confirm("Discard unsaved changes and reload from PC?")) return;
 
-  if (state.fe.editor.path) sendCommand(`fs.read "${state.fe.editor.path}"`);
+  if (state.fe.editor.path) {
+
+    $("fe-editor-status").textContent = "Loading file from host...";
+
+    sendCommand(`fs.read "${state.fe.editor.path}"`);
+
+  }
 
 };
 
@@ -3176,19 +3367,51 @@ if ($("fe-transfer-close")) {
 
 }
 
-function triggerBrowserDownload(url, filename) {
+async function triggerBrowserDownload(url, filename) {
 
-  const a = document.createElement("a");
+  const fullUrl = resolveBackendUrl(url);
 
-  a.href = url;
+  try {
 
-  a.download = filename || "download";
+    const res = await fetch(fullUrl);
 
-  document.body.appendChild(a);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-  a.click();
+    const blob = await res.blob();
 
-  a.remove();
+    const blobUrl = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+
+    a.href = blobUrl;
+
+    a.download = filename || "download";
+
+    document.body.appendChild(a);
+
+    a.click();
+
+    a.remove();
+
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+
+  } catch (e) {
+
+    const a = document.createElement("a");
+
+    a.href = fullUrl;
+
+    a.download = filename || "download";
+
+    a.target = "_blank";
+
+    document.body.appendChild(a);
+
+    a.click();
+
+    a.remove();
+
+  }
 
 }
 
@@ -3946,7 +4169,15 @@ function appendKeys(id, text) {
 
   if (id !== state.selected) return;
 
-  $("keys-output").textContent += text;
+  const out = $("keys-output");
+
+  if (out) {
+
+    out.textContent += text;
+
+    out.scrollTop = out.scrollHeight;
+
+  }
 
 }
 
