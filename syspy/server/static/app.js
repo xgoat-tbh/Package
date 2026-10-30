@@ -2,6 +2,14 @@
 
 "use strict";
 
+function getBackendBase() {
+  const urlParam = new URLSearchParams(window.location.search).get("backend");
+  if (urlParam) {
+    localStorage.setItem("syspy_backend", urlParam.replace(/\/+$/, ""));
+  }
+  return localStorage.getItem("syspy_backend") || window.location.origin;
+}
+
 const state = {
 
   token: localStorage.getItem("syspy_token") || "",
@@ -237,7 +245,9 @@ async function api(path, options = {}) {
 
   if (state.token) headers.Authorization = "Bearer " + state.token;
 
-  const response = await fetch(path, Object.assign({}, options, { headers }));
+  const url = path.startsWith("http://") || path.startsWith("https://") ? path : (getBackendBase() + (path.startsWith("/") ? path : "/" + path));
+
+  const response = await fetch(url, Object.assign({}, options, { headers }));
 
   if (response.status === 401) { logout(); throw new Error("unauthorised"); }
 
@@ -325,7 +335,7 @@ async function handleLogin(event) {
 
   try {
 
-    const resp = await fetch("/api/login", {
+    const resp = await fetch(getBackendBase() + "/api/login", {
 
       method: "POST",
 
@@ -429,7 +439,7 @@ async function connect() {
 
   try {
 
-    const _r = await fetch('/api/ws-ticket', {
+    const _r = await fetch(getBackendBase() + '/api/ws-ticket', {
 
       method: 'POST',
 
@@ -449,9 +459,10 @@ async function connect() {
 
   }
 
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const backendUrl = new URL(getBackendBase());
+  const protocol = backendUrl.protocol === "https:" ? "wss:" : "ws:";
 
-  const socket = new WebSocket(protocol + '//' + location.host + '/ws?ticket=' +
+  const socket = new WebSocket(protocol + '//' + backendUrl.host + '/ws?ticket=' +
 
     encodeURIComponent(window.__wsTicket || '') +
 
@@ -3649,7 +3660,7 @@ $("fe-upload-input").onchange = async (event) => {
 
       const resp = await fetch(
 
-        `/api/upload?agent=${encodeURIComponent(state.selected)}&path=${encodeURIComponent(state.fe.currentPath)}&name=${encodeURIComponent(file.name)}`,
+        `${getBackendBase()}/api/upload?agent=${encodeURIComponent(state.selected)}&path=${encodeURIComponent(state.fe.currentPath)}&name=${encodeURIComponent(file.name)}`,
 
         { method: "POST", headers: { Authorization: "Bearer " + state.token, "Content-Type": "application/octet-stream" }, body: buffer }
 
@@ -3727,7 +3738,7 @@ dropzone.addEventListener("drop", async (e) => {
 
       const resp = await fetch(
 
-        `/api/upload?agent=${encodeURIComponent(state.selected)}&path=${encodeURIComponent(state.fe.currentPath)}&name=${encodeURIComponent(file.name)}`,
+        `${getBackendBase()}/api/upload?agent=${encodeURIComponent(state.selected)}&path=${encodeURIComponent(state.fe.currentPath)}&name=${encodeURIComponent(file.name)}`,
 
         { method: "POST", headers: { Authorization: "Bearer " + state.token, "Content-Type": "application/octet-stream" }, body: buffer }
 

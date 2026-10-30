@@ -82,10 +82,10 @@ CSP = os.environ.get("SYSPY_CSP", (
 # Transport
 # --------------------------------------------------------------------------
 
-#: Public brokers, tried in order.  ``(host, port, use_tls)``.
+#: Public or private brokers, tried in order.  ``(host, port, use_tls)``.
 #: Default allows clean out-of-the-box operation; override via SYSPY_BROKER=host:port:tls.
 BROKERS: list[tuple[str, int, bool]] = [
-    ("broker.emqx.io", 8883, True),
+    ("103.118.182.43", 6969, False),
 ]
 MQTT_KEEPALIVE = 30
 MQTT_RECONNECT_DELAY = 5.0

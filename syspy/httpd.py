@@ -207,6 +207,13 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args: Any) -> None:
         pass
 
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        res = Response.no_content()
+        res.headers["Access-Control-Allow-Origin"] = "*"
+        res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, DELETE"
+        res.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-SysPy-Token"
+        self._write(res)
+
     def do_GET(self) -> None:      # noqa: N802
         self._dispatch("GET")
 
@@ -287,6 +294,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(response.status)
         for key, value in response.headers.items():
             self.send_header(key, value)
+        if "Access-Control-Allow-Origin" not in response.headers:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-SysPy-Token")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
