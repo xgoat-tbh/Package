@@ -1,10 +1,5 @@
 {
-  "version": 2,
-  "cleanUrls": true,
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "/syspy/server/static/$1"
-    }
-  ]
+  "buildCommand": null,
+  "outputDirectory": "public",
+  "cleanUrls": true
 }
