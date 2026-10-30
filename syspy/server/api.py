@@ -239,6 +239,15 @@ class Api:
     def _register_routes(self) -> None:
         app = self.app
 
+        @app.route("GET", "/")
+        def index(request: httpd.Request) -> httpd.Response:
+            return httpd.Response.json(200, {
+                "ok": True,
+                "service": "syspy-backend",
+                "version": config.PRODUCT_VERSION,
+                "frontend": "https://syspy-alpha.vercel.app"
+            })
+
         @app.route("GET", "/api/health")
         def health(request: httpd.Request) -> httpd.Response:
             try:
