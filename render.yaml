@@ -10,7 +10,7 @@ services:
       - key: PYTHON_VERSION
         value: "3.12.8"
       - key: SYSPY_MODE
-        value: "webinstall"
+        value: "controller"
       - key: SYSPY_HOST
         value: 0.0.0.0
       - key: SYSPY_TRUST_PROXY_HOPS
