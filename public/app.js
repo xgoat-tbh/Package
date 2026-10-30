@@ -7,7 +7,10 @@ function getBackendBase() {
   if (urlParam) {
     localStorage.setItem("syspy_backend", urlParam.replace(/\/+$/, ""));
   }
-  return localStorage.getItem("syspy_backend") || window.location.origin;
+  const injected = (window.__SYSPY_CONFIG__ && window.__SYSPY_CONFIG__.backendUrl)
+    ? window.__SYSPY_CONFIG__.backendUrl.replace(/\/+$/, "")
+    : "";
+  return localStorage.getItem("syspy_backend") || injected || window.location.origin;
 }
 
 const state = {
