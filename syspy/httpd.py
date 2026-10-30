@@ -334,6 +334,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             import socket as _sock
             self.connection.setsockopt(_sock.SOL_SOCKET, _sock.SO_KEEPALIVE, 1)
+            self.connection.settimeout(None)  # Long-lived WebSocket connection; don't let 60s HTTP timeout drop it
         except Exception:
             pass
         socket = ws.WebSocket(self.rfile, self.wfile)

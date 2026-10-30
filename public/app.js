@@ -446,7 +446,7 @@ async function connect() {
 
       method: 'POST',
 
-      headers: (typeof token !== 'undefined' && token) ? { Authorization: 'Bearer ' + token } : {},
+      headers: state.token ? { Authorization: 'Bearer ' + state.token } : {},
 
     });
 
@@ -469,7 +469,7 @@ async function connect() {
 
     encodeURIComponent(window.__wsTicket || '') +
 
-    (window.__wsTicket ? '' : '&token=' + encodeURIComponent(typeof token !== 'undefined' ? token : '')));
+    (window.__wsTicket ? '' : '&token=' + encodeURIComponent(state.token || '')));
 
   state.socket = socket;
 
@@ -509,7 +509,10 @@ async function connect() {
 
   };
 
-  socket.onopen = () => { /* wait for snapshot/relay event from server */ };
+  socket.onopen = () => {
+    setWsStatus(true);
+    _backoff = 500;
+  };
 
 }
 
@@ -1099,6 +1102,8 @@ function applyStats(id, stats) {
 
 function setRelay(up) {
 
+  state.relayUp = !!up;
+
   $("relay-dot").classList.toggle("up", !!up);
 
   $("relay-label").textContent = up ? "RELAY CONNECTED" : "RELAY DISCONNECTED";
@@ -1114,6 +1119,14 @@ function setWsStatus(connected) {
     $("relay-dot").classList.remove("up");
 
     $("relay-label").textContent = "DASHBOARD RECONNECTING...";
+
+  } else {
+
+    // WebSocket connected: restore relay status indicator
+
+    $("relay-dot").classList.toggle("up", !!state.relayUp);
+
+    $("relay-label").textContent = state.relayUp ? "RELAY CONNECTED" : "RELAY DISCONNECTED";
 
   }
 
