@@ -153,8 +153,9 @@ class Api:
     # ------------------------------------------------------------------
 
     def _load_state(self) -> dict[str, Any]:
+        env_pwd = os.environ.get("SYSPY_PASSWORD") or os.environ.get("SYSPY_PASS")
         defaults: dict[str, Any] = {
-            "password": os.environ.get("SYSPY_PASSWORD") or secrets.token_urlsafe(9),
+            "password": env_pwd or secrets.token_urlsafe(9),
             "tokens": [],
             "auto_open": True,
         }
@@ -165,6 +166,8 @@ class Api:
                     defaults.update(json.load(handle))
             except (OSError, ValueError):
                 pass
+        if env_pwd:
+            defaults["password"] = _hash_password(env_pwd)
         return defaults
 
     def _save_state(self) -> None:

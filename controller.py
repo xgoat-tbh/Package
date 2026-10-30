@@ -163,9 +163,10 @@ def main(argv: list[str] | None = None) -> int:
         print()
 
     api = Api(root)
-    if args.password:
+    configured_pwd = args.password or os.environ.get("SYSPY_PASSWORD") or os.environ.get("SYSPY_PASS")
+    if configured_pwd:
         from syspy.server.api import _hash_password
-        api.state["password"] = _hash_password(args.password)
+        api.state["password"] = _hash_password(configured_pwd)
         api._save_state()
 
     try:
@@ -185,9 +186,9 @@ def main(argv: list[str] | None = None) -> int:
     print("  SysPy controller " + __version__)
     print("  " + "-" * 46)
     print(f"  dashboard : {url}")
-    generated = not (os.environ.get("SYSPY_PASSWORD") or args.password)
-    print(f"  password  : {api.state['password']}"
-          + ("   (generated - set SYSPY_PASSWORD to pin it)" if generated else ""))
+    generated = not configured_pwd
+    print(f"  password  : {configured_pwd if configured_pwd else api.state['password']}"
+          + ("   (generated - set SYSPY_PASSWORD or SYSPY_PASS to pin it)" if generated else ""))
     if config.PUBKEY_HEX:
         print(f"  signing   : ed25519 {config.PUBKEY_HEX[:16]}...")
     else:
